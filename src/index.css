@@ -1,0 +1,52 @@
+
+.xterm-viewport::-webkit-scrollbar {
+  width: 8px;
+}
+.xterm-viewport::-webkit-scrollbar-track {
+  background: transparent;
+}
+.xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+}
+.xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Force override xterm scrollbar */
+.xterm .xterm-viewport::-webkit-scrollbar {
+  width: 8px !important;
+  background-color: #09090b !important;
+}
+.xterm .xterm-viewport::-webkit-scrollbar-track {
+  background: #09090b !important;
+}
+.xterm .xterm-viewport::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15) !important;
+  border-radius: 4px !important;
+}
+.xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25) !important;
+}
+
+/* Hide xterm scrollbar completely */
+.xterm .xterm-viewport::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+.xterm .xterm-viewport {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Hide ALL scrollbars inside terminal */
+.xterm *::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+.xterm * {
+  -ms-overflow-style: none !important;
+  scrollbar-width: none !important;
+}

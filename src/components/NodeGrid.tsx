@@ -1,0 +1,170 @@
+import { Search, Plus, Server, Globe, Folder, ChevronLeft, Trash2, Edit2 } from "lucide-react";
+import { useState } from "react";
+
+export const NodeGrid = ({ servers, folders, onOpenServer, onEditServer, onAddClick, onRemoveServer, onRemoveFolder, isMobile }: any) => {
+  const [search, setSearch] = useState("");
+  const [activeFolderId, setActiveFolderId] = useState<number | null>(null);
+
+  const filteredServers = servers?.filter((s: any) => 
+    s.name.toLowerCase().includes(search.toLowerCase()) || 
+    s.host.includes(search)
+  ) || [];
+
+  const currentFolder = folders?.find((f: any) => f.id === activeFolderId);
+
+  // If search is active, we might want to just show all matching servers flat,
+  // or still respect the folder. Let's just show them flat if searching.
+  const isSearching = search.trim() !== "";
+
+  const displayedServers = isSearching 
+    ? filteredServers 
+    : filteredServers.filter((s: any) => s.folder_id === activeFolderId);
+  const ServerCard = ({ s }: { s: any }) => (
+    <div 
+      key={s.id} 
+      onClick={() => onOpenServer(s)}
+      className="p-3 h-14 bg-[#16161a] border border-white/5 hover:border-primary/50 hover:shadow-[0_8px_20px_rgba(var(--primary),0.1)] rounded-xl transition-all cursor-pointer group flex items-center justify-between"
+    >
+      <div className="flex items-center gap-3 min-w-0">
+        <div className="w-8 h-8 bg-[#0a0a0c] rounded-lg flex items-center justify-center text-zinc-500 group-hover:text-primary transition-colors shadow-inner border border-white/5 group-hover:border-primary/20 shrink-0">
+          <Server size={14} />
+        </div>
+        <div className="min-w-0 flex-1">
+          <h3 className="font-bold text-zinc-200 text-[13px] truncate tracking-tight">{s.name}</h3>
+          <div className="flex items-center gap-1 mt-0.5">
+            <Globe size={10} className="text-zinc-500 shrink-0" />
+            <span className="text-[10px] text-zinc-500 font-mono truncate group-hover:text-zinc-400 transition-colors">{s.host}</span>
+          </div>
+        </div>
+      </div>
+      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
+        <button 
+          onClick={(e) => { e.stopPropagation(); onEditServer(s); }}
+          className="p-2 text-zinc-500 hover:text-white transition-all"
+        >
+          <Edit2 size={14} />
+        </button>
+        <button 
+          onClick={(e) => { e.stopPropagation(); if(window.confirm('Delete node?')) onRemoveServer(s.id); }}
+          className="p-2 text-zinc-500 hover:text-red-500 transition-all"
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
+    </div>
+  );
+
+  const FolderCard = ({ f }: { f: any }) => {
+    const serverCount = servers?.filter((s: any) => s.folder_id === f.id).length || 0;
+    return (
+      <div 
+        key={f.id} 
+        onClick={() => setActiveFolderId(f.id)}
+        className="p-3 h-14 bg-[#1c1c21] rounded-xl border border-white/5 hover:border-primary/50 hover:bg-white/5 transition-all cursor-pointer group flex items-center justify-between shadow-inner"
+      >
+        <div className="flex items-center gap-3 min-w-0">
+          <Folder size={18} className="text-primary shrink-0" />
+          <h3 className="font-bold text-zinc-200 text-[13px] truncate tracking-tight">{f.name}</h3>
+        </div>
+        <div className="flex items-center gap-2 relative">
+          <span className="text-[10px] bg-black text-zinc-500 px-1.5 py-0.5 rounded-md font-mono shrink-0 group-hover:opacity-0 transition-opacity">{serverCount}</span>
+          <button 
+            onClick={(e) => { e.stopPropagation(); if(window.confirm('Delete folder and all servers inside?')) onRemoveFolder(f.id); }}
+            className="absolute right-0 opacity-0 group-hover:opacity-100 p-1.5 text-zinc-500 hover:text-red-500 transition-all"
+          >
+            <Trash2 size={14} />
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="flex-1 flex flex-col h-full p-6 overflow-hidden bg-transparent">
+      <div className="relative max-w-sm w-full mx-auto mb-6 shrink-0">
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" size={14} />
+        <input 
+          type="text"
+          placeholder="Search nodes..."
+          className="w-full h-9 bg-[#1c1c21] border border-white/10 rounded-lg pl-9 pr-4 text-[13px] text-zinc-100 outline-none focus:border-primary/50 focus:bg-[#16161a] transition-all placeholder:text-zinc-600 shadow-inner"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+      </div>
+
+      <div className="flex-1 overflow-y-auto custom-scrollbar pr-1 pb-10">
+        
+        {/* Header navigation if in folder */}
+        {!isSearching && activeFolderId !== null && (
+          <div className="flex items-center gap-3 mb-6">
+            <button 
+              onClick={() => setActiveFolderId(null)}
+              className="w-8 h-8 bg-black rounded-xl border border-white/5 flex items-center justify-center hover:bg-white/10 hover:text-white text-zinc-500 transition-all shadow-inner"
+            >
+              <ChevronLeft size={16} />
+            </button>
+            <h2 className="text-[14px] font-black text-primary uppercase tracking-[0.2em] flex items-center gap-2">
+              <Folder size={16} /> {currentFolder?.name}
+            </h2>
+          </div>
+        )}
+
+        {servers?.length === 0 && folders?.length === 0 ? (
+          <div className="h-full flex items-center justify-center">
+            <button 
+              onClick={onAddClick}
+              className="flex flex-col items-center gap-4 p-12 rounded-3xl border-2 border-dashed border-zinc-800 hover:border-primary/40 hover:bg-primary/5 transition-all group"
+            >
+              <div className="w-14 h-14 bg-primary/10 rounded-2xl flex items-center justify-center text-primary shadow-[0_0_15px_rgba(var(--primary),0.1)] transition-transform">
+                <Plus size={28} />
+              </div>
+              <div className="text-center">
+                <h3 className="text-[15px] font-bold text-white uppercase tracking-wider">Initialize Node</h3>
+                <p className="text-[12px] text-zinc-500 mt-1 font-medium uppercase tracking-tight">Deploy your first connection</p>
+              </div>
+            </button>
+          </div>
+        ) : (
+          <div className={`grid ${isMobile ? 'grid-cols-1' : 'grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5'} gap-3`}>
+            
+            {/* Show Add Node only in Root or when searching */}
+            {(!isSearching && activeFolderId === null) && (
+              <button 
+                onClick={onAddClick}
+                className="flex items-center gap-3 p-3 h-14 bg-[#16161a] border border-dashed border-white/10 rounded-xl hover:bg-primary/5 hover:border-primary/40 transition-all group shadow-inner"
+              >
+                <div className="w-8 h-8 bg-primary/5 rounded-lg flex items-center justify-center text-zinc-500 group-hover:text-primary transition-colors shrink-0">
+                  <Plus size={16} />
+                </div>
+                <span className="text-[10px] font-bold text-zinc-500 group-hover:text-primary uppercase tracking-widest transition-colors">Add Node</span>
+              </button>
+            )}
+
+            {/* Render Folders (only in root, and when not searching) */}
+            {!isSearching && activeFolderId === null && folders?.map((f: any) => (
+              <FolderCard key={`folder-${f.id}`} f={f} />
+            ))}
+
+            {/* Render Servers */}
+            {displayedServers.map((s: any) => <ServerCard key={`server-${s.id}`} s={s} />)}
+            
+            {/* Empty Folder State */}
+            {!isSearching && activeFolderId !== null && displayedServers.length === 0 && (
+              <div className="col-span-full py-10 text-center text-zinc-600 text-xs italic">
+                No servers in this group
+              </div>
+            )}
+            
+            {/* Empty Search State */}
+            {isSearching && displayedServers.length === 0 && (
+              <div className="col-span-full py-10 text-center text-zinc-600 text-xs italic">
+                No servers match your search
+              </div>
+            )}
+
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};

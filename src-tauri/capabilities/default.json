@@ -1,0 +1,25 @@
+{
+  "$schema": "../gen/schemas/desktop-capability.json",
+  "identifier": "default",
+  "description": "Default capability for the desktop app",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:default",
+    "opener:default",
+    "fs:default",
+    "core:path:default",
+    "core:event:default",
+    "core:app:default",
+    "core:resources:default",
+    "core:menu:default",
+    "core:tray:default",
+    "core:window:default",
+    "core:window:allow-minimize",
+    "core:window:allow-close",
+    "core:window:allow-maximize",
+    "core:window:allow-set-title",
+    "core:image:default",
+    "core:webview:default"
+  ]
+}
