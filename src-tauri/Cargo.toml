@@ -27,4 +27,6 @@ directories = "5.0"
 russh = "0.40"
 russh-keys = "0.40"
 ssh-key = { version = "0.6", features = ["alloc", "encryption", "getrandom", "ed25519", "rsa"] }
+tokio-socks = "0.5"
+async-http-proxy = { version = "1.2", features = ["runtime-tokio"] }
 async-trait = "0.1.89"

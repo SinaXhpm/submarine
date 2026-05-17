@@ -1,19 +1,31 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { TerminalSquare, Folder, Network, AlertTriangle, Check, X, ShieldAlert } from "lucide-react";
+import { TerminalSquare, Folder, Network, AlertTriangle, Check, X, ShieldAlert, Play, Terminal } from "lucide-react";
 import TerminalView from "./TerminalView";
 import SFTPPanel from "./SFTPPanel";
+import { CmdsPanel } from "./CmdsPanel";
 
 export const SessionView = ({ session, onClose, addLog }: any) => {
   const [status, setStatus] = useState<'connecting' | 'connected' | 'failed'>('connecting');
   const [logs, setLogs] = useState<{ msg: string, type: string }[]>([]);
   const [fingerprintPrompt, setFingerprintPrompt] = useState<any>(null);
+  const [isAuthError, setIsAuthError] = useState(false);
   const [customPassword, setCustomPassword] = useState("");
-  const [terminals, setTerminals] = useState<{id: string, title: string}[]>([{ id: `term-0`, title: '1' }]);
+
+  const [terminals, setTerminals] = useState<{id: string, title: string}[]>(() => {
+    return [{ id: `term-0`, title: '1' }];
+  });
+
   const [activeTab, setActiveTab] = useState<string>('term-0');
+  const [activeTool, setActiveTool] = useState<'sftp' | 'tunnels' | 'cmds' | null>(null);
+
+  const initiatedRef = useRef(false);
 
   useEffect(() => {
+    if (initiatedRef.current) return;
+    initiatedRef.current = true;
+
     // Start connection
     invoke("initiate_connection", { sessionId: session.id, serverId: session.serverId, customPassword: customPassword || null })
       .catch(e => {
@@ -30,6 +42,10 @@ export const SessionView = ({ session, onClose, addLog }: any) => {
       setFingerprintPrompt(event.payload);
     });
 
+    const unlistenPromptDismiss = listen(`fingerprint-prompt-dismiss-${session.id}`, () => {
+      setFingerprintPrompt(null);
+    });
+
     const unlistenSuccess = listen(`connection-success-${session.id}`, () => {
       setStatus('connected');
     });
@@ -37,14 +53,17 @@ export const SessionView = ({ session, onClose, addLog }: any) => {
     const unlistenFailed = listen(`connection-failed-${session.id}`, (event: any) => {
       setLogs(prev => [...prev, { msg: `Connection failed: ${event.payload?.reason}`, type: 'error' }]);
       setStatus('failed');
+      setIsAuthError(!!event.payload?.is_auth_error);
       addLog(`SSH_CONNECTION_FAILED [${session.serverName}]: ${event.payload?.reason}`, "error");
     });
 
     return () => {
       unlistenLog.then(f => f());
       unlistenPrompt.then(f => f());
+      unlistenPromptDismiss.then(f => f());
       unlistenSuccess.then(f => f());
       unlistenFailed.then(f => f());
+      
       invoke("disconnect_session", { sessionId: session.id }).catch(console.error);
     };
   }, [session.id, session.serverId]);
@@ -71,23 +90,27 @@ export const SessionView = ({ session, onClose, addLog }: any) => {
             </div>
             {status === 'failed' && (
               <div className="flex gap-2 items-center">
-                <input 
-                  type="password" 
-                  placeholder="Password..." 
-                  className="h-8 bg-[#1a1a1e] rounded-lg px-3 text-xs text-white border border-white/10 outline-none focus:border-primary/50"
-                  value={customPassword}
-                  onChange={e => setCustomPassword(e.target.value)}
-                  onKeyDown={e => {
-                    if(e.key === 'Enter') {
-                      setStatus('connecting');
-                      setLogs([]);
-                      invoke("initiate_connection", { sessionId: session.id, serverId: session.serverId, customPassword: customPassword || null }).catch(console.error);
-                    }
-                  }}
-                />
+                {isAuthError && (
+                  <input 
+                    type="password" 
+                    placeholder="Password..." 
+                    className="h-8 bg-[#1a1a1e] rounded-lg px-3 text-xs text-white border border-white/10 outline-none focus:border-primary/50"
+                    value={customPassword}
+                    onChange={e => setCustomPassword(e.target.value)}
+                    onKeyDown={e => {
+                      if(e.key === 'Enter') {
+                        setStatus('connecting');
+                        setLogs([]);
+                        setIsAuthError(false);
+                        invoke("initiate_connection", { sessionId: session.id, serverId: session.serverId, customPassword: customPassword || null }).catch(console.error);
+                      }
+                    }}
+                  />
+                )}
                 <button onClick={() => {
                   setStatus('connecting');
                   setLogs([]);
+                  setIsAuthError(false);
                   invoke("initiate_connection", { sessionId: session.id, serverId: session.serverId, customPassword: customPassword || null }).catch(console.error);
                 }} className="px-4 py-2 bg-primary/10 text-primary hover:bg-primary/20 rounded-lg text-xs font-bold uppercase tracking-wider transition-colors">
                   Reconnect
@@ -157,7 +180,7 @@ export const SessionView = ({ session, onClose, addLog }: any) => {
           <div key={t.id} className="group relative flex items-center">
             <button 
               onClick={() => setActiveTab(t.id)}
-              className={`h-8 px-4 pr-6 rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${activeTab === t.id ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner' : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-300 border border-transparent'}`}
+              className={`h-8 px-4 pr-6 rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${activeTab === t.id ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner' : 'text-zinc-500 bg-white/[0.02] border border-white/5 hover:bg-white/5 hover:border-white/10 hover:text-zinc-300'}`}
             >
               <TerminalSquare size={14} /> {t.title}
             </button>
@@ -191,39 +214,73 @@ export const SessionView = ({ session, onClose, addLog }: any) => {
 
         <div className="flex items-center gap-1 shrink-0 border-l border-white/5 pl-4">
           <button 
-            onClick={() => setActiveTab('sftp')}
-            className={`h-8 px-4 rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${activeTab === 'sftp' ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner' : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-300 border border-transparent'}`}
+            onClick={() => setActiveTool(activeTool === 'sftp' ? null : 'sftp')}
+            className={`h-8 px-4 rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${activeTool === 'sftp' ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner' : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-300 border border-transparent'}`}
           >
             <Folder size={14} /> SFTP
           </button>
           <button 
-            onClick={() => setActiveTab('tunnels')}
-            className={`h-8 px-4 rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${activeTab === 'tunnels' ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner' : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-300 border border-transparent'}`}
+            onClick={() => setActiveTool(activeTool === 'tunnels' ? null : 'tunnels')}
+            className={`h-8 px-4 rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${activeTool === 'tunnels' ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner' : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-300 border border-transparent'}`}
           >
             <Network size={14} /> Ports
+          </button>
+          <button 
+            onClick={() => setActiveTool(activeTool === 'cmds' ? null : 'cmds')}
+            className={`h-8 px-4 rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${activeTool === 'cmds' ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner' : 'text-zinc-500 hover:bg-white/5 hover:text-zinc-300 border border-transparent'}`}
+          >
+            <Terminal size={14} /> CMDS
           </button>
         </div>
       </div>
 
-      {/* Tab Content */}
-      <div className="flex-1 overflow-hidden relative bg-[#09090b]">
-        {terminals.map(t => (
-          <div key={t.id} className={`absolute inset-0 ${activeTab === t.id ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'}`}>
-            <TerminalView sessionId={session.id} terminalId={t.id} />
-          </div>
-        ))}
-        
-        {activeTab === 'sftp' && (
-          <div className="absolute inset-0 z-10 bg-background">
-            <SFTPPanel />
-          </div>
-        )}
-        
-        {activeTab === 'tunnels' && (
-          <div className="absolute inset-0 z-10 bg-background flex flex-col items-center justify-center text-zinc-500 p-8">
-            <Network size={48} className="mb-4 opacity-20" />
-            <h3 className="text-sm font-bold uppercase tracking-widest text-zinc-400">Port Forwarding</h3>
-            <p className="text-xs mt-2 max-w-md text-center">Manage active local and remote port forwards for this session.</p>
+      {/* Tab Content Split Pane */}
+      <div className="flex-1 flex overflow-hidden relative bg-[#09090b]">
+        {/* Left Panel: Active Terminals */}
+        <div className={`h-full relative transition-all duration-300 ${activeTool ? 'w-2/3' : 'w-full'}`}>
+          {terminals.map(t => (
+            <div key={t.id} className={`absolute inset-0 ${activeTab === t.id ? 'opacity-100 z-10' : 'opacity-0 z-0 pointer-events-none'}`}>
+              <TerminalView sessionId={session.id} terminalId={t.id} />
+            </div>
+          ))}
+        </div>
+
+        {/* Right Panel: Side Panel (SFTP, Ports, CMDS) */}
+        {activeTool && (
+          <div className="w-1/3 shrink-0 border-l border-white/5 bg-[#121214]/95 flex flex-col h-full overflow-hidden animate-in slide-in-from-right duration-300">
+            {activeTool === 'sftp' && (
+              <div className="flex-1 flex flex-col overflow-hidden">
+                <div className="h-10 px-4 flex items-center justify-between border-b border-white/5 bg-white/5">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">SFTP File Browser</span>
+                  <button onClick={() => setActiveTool(null)} className="text-zinc-500 hover:text-white transition-colors">
+                    <X size={14} />
+                  </button>
+                </div>
+                <div className="flex-1 overflow-hidden relative">
+                  <SFTPPanel />
+                </div>
+              </div>
+            )}
+
+            {activeTool === 'tunnels' && (
+              <div className="flex-1 flex flex-col overflow-hidden">
+                <div className="h-10 px-4 flex items-center justify-between border-b border-white/5 bg-white/5">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Port Forwarding</span>
+                  <button onClick={() => setActiveTool(null)} className="text-zinc-500 hover:text-white transition-colors">
+                    <X size={14} />
+                  </button>
+                </div>
+                <div className="flex-1 flex flex-col items-center justify-center text-zinc-500 p-6">
+                  <Network size={36} className="mb-3 opacity-20" />
+                  <h3 className="text-xs font-bold uppercase tracking-widest text-zinc-400">Port Forwarding</h3>
+                  <p className="text-[11px] mt-2 max-w-[280px] text-center">Manage active local and remote port forwards for this session.</p>
+                </div>
+              </div>
+            )}
+
+            {activeTool === 'cmds' && (
+              <CmdsPanel activeTab={activeTab} onClose={() => setActiveTool(null)} />
+            )}
           </div>
         )}
       </div>

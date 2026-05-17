@@ -1,52 +1,34 @@
-
-.xterm-viewport::-webkit-scrollbar {
-  width: 8px;
-}
-.xterm-viewport::-webkit-scrollbar-track {
-  background: transparent;
-}
-.xterm-viewport::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
-  border-radius: 4px;
-}
-.xterm-viewport::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
-}
-
-/* Force override xterm scrollbar */
+/* Modern custom theme-matching scrollbar for Xterm terminal viewports */
+.xterm-viewport::-webkit-scrollbar,
 .xterm .xterm-viewport::-webkit-scrollbar {
-  width: 8px !important;
-  background-color: #09090b !important;
+  display: block !important;
+  width: 5px !important;
+  height: 5px !important;
+  background-color: transparent !important;
 }
+
+.xterm-viewport::-webkit-scrollbar-track,
 .xterm .xterm-viewport::-webkit-scrollbar-track {
-  background: #09090b !important;
+  background: transparent !important;
 }
+
+.xterm-viewport::-webkit-scrollbar-thumb,
 .xterm .xterm-viewport::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.15) !important;
-  border-radius: 4px !important;
+  background: rgba(16, 185, 129, 0.15) !important; /* Low-opacity emerald green to blend with the dark theme */
+  border-radius: 9999px !important;
+  border: 1px solid rgba(16, 185, 129, 0.05) !important;
+  transition: background-color 0.2s ease-in-out !important;
 }
+
+.xterm-viewport::-webkit-scrollbar-thumb:hover,
 .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.25) !important;
+  background: rgba(16, 185, 129, 0.4) !important; /* Higher opacity emerald green on hover */
+  border: 1px solid rgba(16, 185, 129, 0.1) !important;
 }
 
-/* Hide xterm scrollbar completely */
-.xterm .xterm-viewport::-webkit-scrollbar {
-  display: none !important;
-  width: 0 !important;
-  height: 0 !important;
-}
+.xterm-viewport,
 .xterm .xterm-viewport {
-  -ms-overflow-style: none;
-  scrollbar-width: none;
-}
-
-/* Hide ALL scrollbars inside terminal */
-.xterm *::-webkit-scrollbar {
-  display: none !important;
-  width: 0 !important;
-  height: 0 !important;
-}
-.xterm * {
-  -ms-overflow-style: none !important;
-  scrollbar-width: none !important;
+  -ms-overflow-style: auto !important;
+  scrollbar-width: thin !important;
+  scrollbar-color: rgba(16, 185, 129, 0.15) transparent !important;
 }

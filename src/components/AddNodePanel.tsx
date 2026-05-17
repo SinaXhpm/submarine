@@ -155,8 +155,19 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
             {newNode.proxyType !== 'none' && (
               <div className="grid grid-cols-4 gap-3 animate-in fade-in">
-                <input className="col-span-3 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder="Proxy Host" />
-                <input className="h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder="Port" />
+                <input
+                  className="col-span-3 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
+                  placeholder="Proxy Host"
+                  value={newNode.proxyHost || ""}
+                  onChange={e => setNewNode({ ...newNode, proxyHost: e.target.value })}
+                />
+                <input
+                  type="number"
+                  className="h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
+                  placeholder="Port"
+                  value={newNode.proxyPort || ""}
+                  onChange={e => setNewNode({ ...newNode, proxyPort: parseInt(e.target.value) || 0 })}
+                />
               </div>
             )}
 

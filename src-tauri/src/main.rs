@@ -5,7 +5,6 @@ use argon2::{password_hash::{PasswordHasher, SaltString}, Argon2};
 use rand::Rng;
 use rusqlite::Connection;
 use std::sync::Mutex as StdMutex;
-use tokio::sync::Mutex;
 use std::path::PathBuf;
 use std::fs;
 use tauri::Manager;
@@ -15,7 +14,7 @@ mod ssh_manager;
 use ssh_manager::SshState;
 
 pub struct DbState {
-    pub conn: StdMutex<Option<Connection>>,
+    pub conn: std::sync::Arc<StdMutex<Option<Connection>>>,
     pub master_key: StdMutex<Option<[u8; 32]>>,
     pub db_path: StdMutex<Option<PathBuf>>,
 }
@@ -533,20 +532,36 @@ async fn initiate_connection(app: tauri::AppHandle, state: tauri::State<'_, SshS
     use tokio::time::Duration;
     use russh::client;
     use std::sync::Arc;
+    use tokio::sync::Mutex;
     
+    println!("[BACKEND] initiate_connection invoked for session_id: {}, server_id: {}", session_id, server_id);
+
+    // 1. Prevent duplicate connections
+    {
+        let connections = state.connections.lock().await;
+        if connections.contains_key(&session_id) {
+            println!("[BACKEND] Connection already active for session: {}", session_id);
+            return Ok(());
+        }
+        
+        let fp_txs = state.fp_txs.lock().await;
+        if fp_txs.contains_key(&session_id) {
+            println!("[BACKEND] Fingerprint check already in progress for session: {}", session_id);
+            return Ok(());
+        }
+    }
+
+    println!("[BACKEND] No duplicates found. Registering oneshot channel and spawning connection worker...");
     let (fp_tx, fp_rx) = tokio::sync::oneshot::channel();
     state.fp_txs.lock().await.insert(session_id.clone(), fp_tx);
 
-    let handler = ssh_manager::ClientHandler {
-        app: app.clone(),
-        session_id: session_id.clone(),
-        fp_rx: Some(fp_rx),
-    };
-
     let session_id_clone = session_id.clone();
     let state_connections = Arc::clone(&state.connections);
-    
-    let (host, port, user, password, key_id) = {
+    let fp_txs_clone = Arc::clone(&state.fp_txs);
+    let db_conn_shared = Arc::clone(&db_state.conn);
+
+    // Fetch DB record inside a nested block to drop non-Send Rows/Statement before any await
+    let db_res = {
         let conn_guard = db_state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
         let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
         
@@ -554,7 +569,8 @@ async fn initiate_connection(app: tauri::AppHandle, state: tauri::State<'_, SshS
             SELECT s.host, s.port, 
                    COALESCE(c.username, s.username) as username,
                    COALESCE(c.password, s.password) as password, 
-                   c.key_id
+                   c.key_id,
+                   s.proxy_type, s.proxy_host, s.proxy_port
             FROM servers s
             LEFT JOIN credentials c ON s.credential_id = c.id
             WHERE s.id=?1
@@ -562,41 +578,218 @@ async fn initiate_connection(app: tauri::AppHandle, state: tauri::State<'_, SshS
         
         let mut rows = stmt.query([server_id]).map_err(|e| e.to_string())?;
         if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            (
+            Some((
                 row.get::<_, String>(0).unwrap(), 
                 row.get::<_, i32>(1).unwrap(), 
                 row.get::<_, String>(2).unwrap_or_default(),
                 row.get::<_, Option<String>>(3).unwrap_or_default(),
-                row.get::<_, Option<i32>>(4).unwrap_or_default()
-            )
+                row.get::<_, Option<i32>>(4).unwrap_or_default(),
+                row.get::<_, Option<String>>(5).unwrap_or_default().unwrap_or_else(|| "none".to_string()),
+                row.get::<_, Option<String>>(6).unwrap_or_default(),
+                row.get::<_, Option<i32>>(7).unwrap_or_default()
+            ))
         } else {
+            None
+        }
+    };
+
+    let (host, port, user, password, _key_id, proxy_type, proxy_host, proxy_port) = match db_res {
+        Some(val) => val,
+        None => {
+            state.fp_txs.lock().await.remove(&session_id);
             return Err("Server not found".into());
         }
     };
 
+    let handler = ssh_manager::ClientHandler {
+        app: app.clone(),
+        session_id: session_id.clone(),
+        server_host: host.clone(),
+        server_port: port as u16,
+        db: db_conn_shared,
+        fp_rx: Some(fp_rx),
+    };
+
     tauri::async_runtime::spawn(async move {
+        println!("[BACKEND WORKER] Started connection worker thread for session: {}", session_id_clone);
+
+        struct FpCleanupGuard {
+            fp_txs: Arc<Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>>,
+            session_id: String,
+        }
+        impl Drop for FpCleanupGuard {
+            fn drop(&mut self) {
+                let fp_txs = Arc::clone(&self.fp_txs);
+                let session_id = self.session_id.clone();
+                tauri::async_runtime::spawn(async move {
+                    fp_txs.lock().await.remove(&session_id);
+                    println!("[BACKEND WORKER] FpCleanupGuard: Evicted session {} from pending list.", session_id);
+                });
+            }
+        }
+        let _guard = FpCleanupGuard {
+            fp_txs: Arc::clone(&fp_txs_clone),
+            session_id: session_id_clone.clone(),
+        };
+
         let emit_log = |msg: &str, log_type: &str| {
+            println!("[LOG-{}] {}", session_id_clone, msg);
             let _ = app.emit(&format!("session-log-{}", session_id_clone), serde_json::json!({"msg": msg, "type": log_type}));
         };
 
-        emit_log(&format!("Connecting to {}...", host), "info");
+        let cleanup = || async {
+            // Already handled by Drop Guard, but keeping for immediate eviction if needed
+            fp_txs_clone.lock().await.remove(&session_id_clone);
+        };
+
+        emit_log("Initializing SSH connection process...", "info");
+        emit_log(&format!("Server Details -> Host: {}, Port: {}, User: {}", host, port, user), "info");
+
+        // Set up generic stream based on proxy configuration
+        trait AsyncStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {}
+        impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static> AsyncStream for T {}
+
+        struct StreamWrapper(Box<dyn AsyncStream>);
+        impl tokio::io::AsyncRead for StreamWrapper {
+            fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut *self.0).poll_read(cx, buf)
+            }
+        }
+        impl tokio::io::AsyncWrite for StreamWrapper {
+            fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+                std::pin::Pin::new(&mut *self.0).poll_write(cx, buf)
+            }
+            fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut *self.0).poll_flush(cx)
+            }
+            fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut *self.0).poll_shutdown(cx)
+            }
+        }
+
+        let stream_res: Result<Box<dyn AsyncStream>, String> = match proxy_type.as_str() {
+            "socks5" => {
+                let p_host = match proxy_host.as_ref().filter(|h| !h.is_empty()) {
+                    Some(h) => h,
+                    None => {
+                        let err_msg = "SOCKS5 Proxy Host is empty";
+                        emit_log(&format!("Error: {}", err_msg), "error");
+                        cleanup().await;
+                        let _ = app.emit(&format!("connection-failed-{}", session_id_clone), serde_json::json!({"reason": err_msg}));
+                        return;
+                    }
+                };
+                let p_port = proxy_port.unwrap_or(1080) as u16;
+                emit_log(&format!("Connecting via SOCKS5 Proxy {}:{}...", p_host, p_port), "info");
+                
+                let proxy_addr = format!("{}:{}", p_host, p_port);
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    tokio_socks::tcp::Socks5Stream::connect(proxy_addr.as_str(), (host.as_str(), port as u16))
+                ).await {
+                    Ok(Ok(stream)) => {
+                        emit_log("SOCKS5 Proxy tunnel established successfully.", "success");
+                        Ok(Box::new(stream))
+                    }
+                    Ok(Err(e)) => {
+                        Err(format!("SOCKS5 connection error: {}", e))
+                    }
+                    Err(_) => {
+                        Err("SOCKS5 proxy connection timed out after 10 seconds".to_string())
+                    }
+                }
+            }
+            "http" => {
+                let p_host = match proxy_host.as_ref().filter(|h| !h.is_empty()) {
+                    Some(h) => h,
+                    None => {
+                        let err_msg = "HTTP Proxy Host is empty";
+                        emit_log(&format!("Error: {}", err_msg), "error");
+                        cleanup().await;
+                        let _ = app.emit(&format!("connection-failed-{}", session_id_clone), serde_json::json!({"reason": err_msg}));
+                        return;
+                    }
+                };
+                let p_port = proxy_port.unwrap_or(8080) as u16;
+                emit_log(&format!("Connecting via HTTP Proxy {}:{}...", p_host, p_port), "info");
+
+                let proxy_addr = format!("{}:{}", p_host, p_port);
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    tokio::net::TcpStream::connect(proxy_addr)
+                ).await {
+                    Ok(Ok(mut tcp_stream)) => {
+                        emit_log(&format!("Requesting HTTP CONNECT tunnel to {}:{}...", host, port), "info");
+                        match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            async_http_proxy::http_connect_tokio(&mut tcp_stream, &host, port as u16)
+                        ).await {
+                            Ok(Ok(_)) => {
+                                emit_log("HTTP Proxy tunnel established successfully.", "success");
+                                Ok(Box::new(tcp_stream))
+                            }
+                            Ok(Err(e)) => {
+                                Err(format!("HTTP CONNECT tunnel failed: {}", e))
+                            }
+                            Err(_) => {
+                                Err("HTTP CONNECT tunnel request timed out".to_string())
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        Err(format!("HTTP proxy network connection failed: {}", e))
+                    }
+                    Err(_) => {
+                        Err("HTTP proxy connection timed out after 10 seconds".to_string())
+                    }
+                }
+            }
+            _ => {
+                emit_log(&format!("Connecting directly to {}:{}...", host, port), "info");
+                match tokio::time::timeout(
+                    Duration::from_secs(10),
+                    tokio::net::TcpStream::connect((host.as_str(), port as u16))
+                ).await {
+                    Ok(Ok(stream)) => {
+                        emit_log("Direct TCP Connection established successfully.", "success");
+                        Ok(Box::new(stream))
+                    }
+                    Ok(Err(e)) => {
+                        Err(format!("Direct connection failed: {}", e))
+                    }
+                    Err(_) => {
+                        Err("Direct connection timed out after 10 seconds".to_string())
+                    }
+                }
+            }
+        };
+
+        let stream = match stream_res {
+            Ok(s) => s,
+            Err(e) => {
+                emit_log(&e, "error");
+                cleanup().await;
+                let _ = app.emit(&format!("connection-failed-{}", session_id_clone), serde_json::json!({"reason": e}));
+                return;
+            }
+        };
+
+        emit_log("Starting SSH Handshake and establishing secure session...", "info");
         let config = client::Config::default();
         let config = Arc::new(config);
-        let sh = handler;
         
-        let connect_future = client::connect(config, (host.as_str(), port as u16), sh);
-        
+        let connect_future = client::connect_stream(config, StreamWrapper(stream), handler);
+
         match tokio::time::timeout(Duration::from_secs(15), connect_future).await {
             Ok(Ok(mut session)) => {
-                emit_log("TCP Connected. Authenticating...", "info");
+                emit_log("SSH Handshake complete. Authenticating user...", "info");
                 
                 let final_pass = custom_password.or(password);
                 
                 let auth_res = if let Some(pass) = final_pass {
-                    // Password Auth
+                    emit_log("Attempting Password Authentication...", "info");
                     session.authenticate_password(user, pass).await
                 } else {
-                    // TODO: implement Key Auth
                     emit_log("Key auth not yet implemented in Phase 1", "warn");
                     Ok(false)
                 };
@@ -609,24 +802,27 @@ async fn initiate_connection(app: tauri::AppHandle, state: tauri::State<'_, SshS
                     },
                     Ok(false) => {
                         emit_log("Authentication failed (Access Denied).", "error");
-                        let _ = app.emit(&format!("connection-failed-{}", session_id_clone), serde_json::json!({"reason": "Access Denied"}));
+                        let _ = app.emit(&format!("connection-failed-{}", session_id_clone), serde_json::json!({"reason": "Access Denied", "is_auth_error": true}));
                     },
                     Err(e) => {
                         emit_log(&format!("Auth error: {}", e), "error");
-                        let _ = app.emit(&format!("connection-failed-{}", session_id_clone), serde_json::json!({"reason": e.to_string()}));
+                        let _ = app.emit(&format!("connection-failed-{}", session_id_clone), serde_json::json!({"reason": e.to_string(), "is_auth_error": true}));
                     }
                 }
             },
             Ok(Err(e)) => {
-                emit_log(&format!("Connection failed: {}", e), "error");
+                emit_log(&format!("SSH connection failed: {}", e), "error");
                 let _ = app.emit(&format!("connection-failed-{}", session_id_clone), serde_json::json!({"reason": e.to_string()}));
             },
             Err(_) => {
-                emit_log("Connection timed out after 15 seconds.", "error");
-                let _ = app.emit(&format!("connection-failed-{}", session_id_clone), serde_json::json!({"reason": "Connection Timed Out"}));
+                emit_log("SSH connection timed out during handshake (15 seconds limit).", "error");
+                let _ = app.emit(&format!("connection-failed-{}", session_id_clone), serde_json::json!({"reason": "Handshake Timed Out"}));
             }
         }
+
+        cleanup().await;
     });
+    
     Ok(())
 }
 
@@ -747,7 +943,7 @@ async fn close_terminal(state: tauri::State<'_, SshState>, terminal_id: String) 
 
 fn main() {
     tauri::Builder::default()
-        .manage(DbState { conn: StdMutex::new(None), master_key: StdMutex::new(None), db_path: StdMutex::new(None) })
+        .manage(DbState { conn: std::sync::Arc::new(StdMutex::new(None)), master_key: StdMutex::new(None), db_path: StdMutex::new(None) })
         .manage(SshState::new())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
