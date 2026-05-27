@@ -22,3 +22,40 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Server-side PHP code lives in a separate deployment (cPanel host).
+# Kept locally as a reference snapshot but never committed.
+mock-api/
+
+# Claude Code local state — permission allowlists, scheduled-task locks.
+# Project-specific to each developer's machine, not meant to be shared.
+.claude/
+
+# Generated icon artefacts. The canonical source is `app-icon.png`. Anything
+# derived from it (`tools/fix-icon.ps1` output + `npm run tauri icon` source)
+# is reproducible from that one file, so we don't commit duplicates.
+app-icon-circular.png
+# Discarded alternative logos / experiments. Kept locally but not shipped.
+app-icon2.png
+app-icon3.png
+# Old CSS snapshot kept while migrating xterm styling — superseded by
+# the current src/index.css. Not part of the build.
+original_index.css
+
+# Local config / environment files. Anything matching is per-developer
+# secrets (or a personal override) and must not land in version control.
+# (`*.local` is already covered earlier in this file.)
+.env
+.env.*
+!.env.example
+
+# Editor and OS scratch files we haven't already covered above.
+Thumbs.db
+desktop.ini
+*.bak
+*.tmp
+*.tsbuildinfo
+
+# Test/coverage output (no test suite yet, but pre-empt the typical paths).
+coverage/
+.nyc_output/
