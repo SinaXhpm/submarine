@@ -543,6 +543,11 @@ async fn setup_master_db(app_handle: tauri::AppHandle, mut password: String, sta
         let encrypted_data = fs::read(&path)
             .map_err(|e| format!("[FILE] VAULT_READ_FAILED: {}", e))?;
         let (parsed_salt, nonce, ciphertext) = parse_vault_blob(&encrypted_data)?;
+        // Normalise the Vec<u8> salt into a fixed-size array up front so we
+        // can copy it into both the spawn_blocking closure (move-by-Copy) and
+        // the salt_bytes slot later, without juggling clones or lifetimes.
+        let mut salt_fixed = [0u8; SALT_LEN];
+        salt_fixed.copy_from_slice(&parsed_salt);
         // Argon2id with m=64MiB is CPU-heavy (≈0.5–2s depending on hardware).
         // Running it directly on the async runtime thread blocks every other
         // Tauri command for that duration — UI freezes, IPC backs up. Hand
@@ -551,7 +556,7 @@ async fn setup_master_db(app_handle: tauri::AppHandle, mut password: String, sta
         // done, preserving the secret-hygiene the original sync path had.
         let mut password_owned = std::mem::take(&mut password);
         let derived = tokio::task::spawn_blocking(move || {
-            let res = derive_key(&password_owned, &parsed_salt);
+            let res = derive_key(&password_owned, &salt_fixed);
             password_owned.zeroize();
             res
         })
@@ -561,9 +566,7 @@ async fn setup_master_db(app_handle: tauri::AppHandle, mut password: String, sta
         let raw = Zeroizing::new(decrypt_with_key(&ciphertext, &nonce, &key)?);
         let decrypted_data = Zeroizing::new(vault_decompress(&raw)?);
 
-        let mut buf = [0u8; SALT_LEN];
-        buf.copy_from_slice(&parsed_salt);
-        salt_bytes = buf;
+        salt_bytes = salt_fixed;
         needs_resave = false;
 
         conn = Connection::open_in_memory()
