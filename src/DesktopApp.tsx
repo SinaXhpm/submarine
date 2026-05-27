@@ -6,18 +6,28 @@ import {
   ArrowLeftRight, Shield, User, Cpu, TerminalSquare, List, Edit2
 } from "lucide-react";
 
-import AuthPage from "./components/AuthPage";
+import ProfileSelectPage from "./components/ProfileSelectPage";
+import logoUrl from "./assets/logo.png";
+import PasswordField from "./components/PasswordField";
+import QuickConnectModal, { QuickAuth } from "./components/QuickConnectModal";
+import { useConfirm } from "./ui/confirm";
+import { useIsNarrow } from "./hooks/useViewport";
 import { Sidebar } from "./components/Sidebar";
 import { NodeGrid } from "./components/NodeGrid";
 import AddNodePanel from "./components/AddNodePanel";
-import SFTPPanel from "./components/SFTPPanel";
 import TerminalView from "./components/TerminalView";
 import SettingsPanel from "./components/SettingsPanel";
 import { SessionView } from "./components/SessionView";
+import MonitoringPanel from "./components/MonitoringPanel";
+import { ErrorBoundary } from "./ui/ErrorBoundary";
 
 const appWindow = getCurrentWindow();
 
-type Session = { id: string; serverId: number; serverName: string; };
+// Sessions can be either DB-backed (saved node, `serverId > 0`) or quick
+// connect (one-shot, `serverId === 0` and `quickAuth` populated). SessionView
+// forwards `quickAuth` to `initiate_connection` which uses it instead of
+// looking up the DB row.
+type Session = { id: string; serverId: number; serverName: string; quickAuth?: QuickAuth | null };
 
 const hexToRgb = (hex: string) => {
   const r = parseInt(hex.slice(1, 3), 16);
@@ -29,14 +39,14 @@ const hexToRgb = (hex: string) => {
 function DesktopApp() {
   const [loading, setLoading] = useState(true);
   const [isUnlocked, setIsUnlocked] = useState(false);
-  const [dbExists, setDbExists] = useState(false);
-  const [password, setPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
-  const [error, setError] = useState("");
+  // `activeProfile` is the name the user picked + unlocked. Stays null
+  // until ProfileSelectPage's onUnlocked fires, at which point the app
+  // flips straight into the main view — no intermediate state.
+  const [activeProfile, setActiveProfile] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<string>("nodes");
   const [sessions, setSessions] = useState<Session[]>([]);
   const [isPanelOpen, setIsPanelOpen] = useState(false);
-  const [showResetConfirm, setShowResetConfirm] = useState(false);
+  const [isQuickConnectOpen, setIsQuickConnectOpen] = useState(false);
   const [servers, setServers] = useState<any[]>([]);
   const [credentials, setCredentials] = useState<any[]>([]);
   const [sshKeys, setSshKeys] = useState<any[]>([]);
@@ -56,18 +66,21 @@ function DesktopApp() {
   const defaultNode = {
     id: null as number | null,
     name: "", host: "", port: 22, username: "", password: "",
-    authType: "vault", credentialId: "", folderId: "",
+    authType: "vault", credentialId: "", folderId: "", keyId: "",
     proxyType: "none", proxyHost: "", proxyPort: 1080,
     tunnels: [] as { local: string, remote: string, type: string }[]
   };
 
-  const [isMobile, setIsMobile] = useState(false);
+  // Live width-based "narrow viewport" flag. Replaces a one-shot UA check
+  // that couldn't see a desktop window being shrunk by the user — the new
+  // hook updates on every resize so layout swaps follow the actual width.
+  const isMobile = useIsNarrow();
 
   const [newNode, setNewNode] = useState(defaultNode);
   const [appSettings, setAppSettings] = useState({
-    primaryColor: localStorage.getItem('omni-primary-color') || '#10b981',
-    backgroundColor: localStorage.getItem('omni-bg-color') || '#0a0a0c',
-    terminalFontSize: parseInt(localStorage.getItem('omni-terminal-font-size') || '14')
+    primaryColor: localStorage.getItem('submarine-primary-color') || '#60a5fa',
+    backgroundColor: localStorage.getItem('submarine-bg-color') || '#0a0a0c',
+    terminalFontSize: parseInt(localStorage.getItem('submarine-terminal-font-size') || '14')
   });
 
   useEffect(() => {
@@ -75,17 +88,21 @@ function DesktopApp() {
     document.documentElement.style.setProperty('--primary', rgb);
     document.documentElement.style.setProperty('--primary-hex', appSettings.primaryColor);
     document.documentElement.style.setProperty('--background', appSettings.backgroundColor);
-    localStorage.setItem('omni-primary-color', appSettings.primaryColor);
-    localStorage.setItem('omni-bg-color', appSettings.backgroundColor);
-    localStorage.setItem('omni-terminal-font-size', appSettings.terminalFontSize.toString());
+    localStorage.setItem('submarine-primary-color', appSettings.primaryColor);
+    localStorage.setItem('submarine-bg-color', appSettings.backgroundColor);
+    localStorage.setItem('submarine-terminal-font-size', appSettings.terminalFontSize.toString());
+    // Tell already-mounted terminals to re-fit with the new font size.
+    // Without this dispatch the listener in TerminalView is dead code and
+    // users have to close+reopen every terminal to see a size change.
+    window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
   }, [appSettings]);
 
   useEffect(() => {
     const init = async () => {
       try {
         // Restore window size
-        const savedW = localStorage.getItem('omni-window-width');
-        const savedH = localStorage.getItem('omni-window-height');
+        const savedW = localStorage.getItem('submarine-window-width');
+        const savedH = localStorage.getItem('submarine-window-height');
         if (savedW && savedH) {
           try {
             await appWindow.setSize(new LogicalSize(parseInt(savedW), parseInt(savedH)));
@@ -96,17 +113,17 @@ function DesktopApp() {
         await appWindow.onResized(async () => {
           const size = await appWindow.innerSize();
           const logical = size.toLogical(await appWindow.scaleFactor());
-          localStorage.setItem('omni-window-width', logical.width.toString());
-          localStorage.setItem('omni-window-height', logical.height.toString());
+          localStorage.setItem('submarine-window-width', logical.width.toString());
+          localStorage.setItem('submarine-window-height', logical.height.toString());
         });
 
-        // Initial mobile check (using UserAgent as a more principled parameter)
-        const isMobileDevice = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-        setIsMobile(isMobileDevice);
+        // `isMobile` is now driven by `useIsNarrow()` (live viewport hook)
+        // — no one-shot UA detection here anymore.
 
-        const exists = await invoke("check_db_exists");
-        setDbExists(exists as boolean);
-      } catch (e) { 
+        // Profile picker comes first now — we no longer probe a single
+        // global vault file. `dbExists` is set inside `handleProfileSelected`
+        // when the user picks a profile.
+      } catch (e) {
         console.error("Initialization error", e);
         addLog(`INIT_EXCEPTION: ${e}`, "error"); 
       } finally { 
@@ -117,56 +134,106 @@ function DesktopApp() {
   }, []);
 
   const addLog = (msg: string, type = "info") => {
-    setLogs(prev => [...prev.slice(-99), { msg, type, time: new Date().toLocaleTimeString() }]);
+    // Each entry gets a stable monotonically-increasing id so React can
+    // reconcile rows correctly when the list is rendered reversed. Using
+    // `key={index}` on a reverse-then-map list (the previous approach)
+    // re-keys every row on every push and busts list reconciliation.
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setLogs(prev => [...prev.slice(-99), { id, msg, type, time: new Date().toLocaleTimeString() }]);
   };
 
-  const refreshData = async () => {
-    try {
-      const [s, c, k, f, cmd] = await Promise.all([
-        invoke("get_servers"),
-        invoke("get_credentials"),
-        invoke("get_ssh_keys"),
-        invoke("get_folders"),
-        invoke("get_commands")
-      ]);
-      setServers(s as any[]);
-      setCredentials(c as any[]);
-      setSshKeys(k as any[]);
-      setFolders(f as any[]);
-      setCommands(cmd as any[]);
-    } catch (e) { addLog(`SYNC_EXCEPTION: ${e}`, "error"); }
+  const refreshServers = async () => {
+    try { setServers((await invoke("get_servers")) as any[]); }
+    catch (e) { addLog(`SYNC_SERVERS: ${e}`, "error"); }
+  };
+  const refreshCredentials = async () => {
+    try { setCredentials((await invoke("get_credentials")) as any[]); }
+    catch (e) { addLog(`SYNC_CREDENTIALS: ${e}`, "error"); }
+  };
+  const refreshSshKeys = async () => {
+    try { setSshKeys((await invoke("get_ssh_keys")) as any[]); }
+    catch (e) { addLog(`SYNC_SSH_KEYS: ${e}`, "error"); }
+  };
+  const refreshFolders = async () => {
+    try { setFolders((await invoke("get_folders")) as any[]); }
+    catch (e) { addLog(`SYNC_FOLDERS: ${e}`, "error"); }
+  };
+  const refreshCommands = async () => {
+    try { setCommands((await invoke("get_commands")) as any[]); }
+    catch (e) { addLog(`SYNC_COMMANDS: ${e}`, "error"); }
+  };
+  const refreshAll = async () => {
+    await Promise.all([
+      refreshServers(),
+      refreshCredentials(),
+      refreshSshKeys(),
+      refreshFolders(),
+      refreshCommands(),
+    ]);
   };
 
   const removeServer = async (id: number) => {
     try {
       await invoke("delete_server", { id });
-      refreshData();
-      addLog("Node removed.", "info");
+      refreshServers();
+      addLog("Server removed.", "info");
     } catch (e) { addLog(`DELETE_EXCEPTION: ${e}`, "error"); }
   };
 
   const removeFolder = async (id: number) => {
     try {
       await invoke("delete_folder", { id });
-      refreshData();
-      addLog("Group removed.", "info");
+      // delete_folder cascades to its servers (see main.rs), so refresh both.
+      await Promise.all([refreshFolders(), refreshServers()]);
+      addLog("Folder removed.", "info");
     } catch (e) { addLog(`DELETE_EXCEPTION: ${e}`, "error"); }
   };
 
-  const handleAuth = async () => {
-    if (!dbExists && password !== confirmPassword) {
-      setError("KEYS_DO_NOT_MATCH");
-      return;
+  // ProfileSelectPage handles the entire profile pick + password + create
+  // flow on a single screen. By the time it fires `onUnlocked`, the
+  // backend has both selected the profile AND decrypted the DB — we just
+  // flip the UI and refresh data.
+  const handleProfileUnlocked = (name: string) => {
+    setActiveProfile(name);
+    setIsUnlocked(true);
+    refreshAll();
+    addLog(`Profile "${name}" unlocked.`, "success");
+  };
+
+  const confirm = useConfirm();
+
+  // Lock the current profile and return to the picker. Confirms first when
+  // there are open SSH sessions because they will be torn down — accidental
+  // double-clicks on the lock icon shouldn't kill the user's terminal work.
+  const handleLogout = async () => {
+    if (sessions.length > 0) {
+      const ok = await confirm({
+        title: "Switch profile?",
+        message: `You have ${sessions.length} open SSH session${sessions.length === 1 ? "" : "s"}. Switching will disconnect ${sessions.length === 1 ? "it" : "them all"} and take you back to the profile picker.`,
+        okLabel: "Switch",
+        cancelLabel: "Stay",
+        destructive: true,
+      });
+      if (!ok) return;
+      // Best-effort: tell the backend to clean up each session. We don't
+      // bail if one fails — `close_profile` will drop the DB anyway, and
+      // the OS will eventually reap the sockets.
+      for (const s of sessions) {
+        try { await invoke("disconnect_session", { sessionId: s.id }); }
+        catch (e) { console.error("disconnect on logout failed:", e); }
+      }
     }
-    try {
-      await invoke("setup_master_db", { password });
-      setIsUnlocked(true);
-      refreshData();
-      addLog("Vault authorized.", "success");
-    } catch (err) {
-      setError("ACCESS_DENIED");
-      addLog(`AUTH_EXCEPTION: ${err}`, "error");
-    }
+    try { await invoke("close_profile"); }
+    catch (e) { addLog(`LOGOUT_EXCEPTION: ${e}`, "error"); }
+
+    // Reset all client state so the picker starts fresh — no stale
+    // servers/credentials/sessions leaking across profile contexts.
+    setIsUnlocked(false);
+    setActiveProfile(null);
+    setSessions([]);
+    setActiveView("nodes");
+    setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setCommands([]);
+    addLog("Profile locked.", "info");
   };
 
   const openServer = (server: any) => {
@@ -183,6 +250,24 @@ function DesktopApp() {
     setActiveView(sessionId);
   };
 
+  // Spawn a one-shot session from inline auth — no DB row created. The
+  // session id is timestamped so multiple quick connects to the same host
+  // don't collide as separate tabs. `serverId = 0` is our sentinel for
+  // "look at quickAuth, not the DB" on the backend side.
+  const openQuickConnect = (auth: QuickAuth) => {
+    const sessionId = `session-quick-${Date.now()}`;
+    const displayName = `${auth.username}@${auth.host}:${auth.port}`;
+    setSessions((prev: Session[]) => [...prev, {
+      id: sessionId,
+      serverId: 0,
+      serverName: displayName,
+      quickAuth: auth,
+    }]);
+    setActiveView(sessionId);
+    setIsQuickConnectOpen(false);
+    addLog(`Quick connect → ${displayName}`, "info");
+  };
+
   const handleEditNode = (server: any) => {
     setNewNode({
       id: server.id,
@@ -191,9 +276,10 @@ function DesktopApp() {
       port: server.port || 22,
       username: server.username || "",
       password: server.password || "",
-      authType: server.credential_id ? "vault" : "custom_pass",
+      authType: server.auth_type || (server.credential_id ? "vault" : "custom_pass"),
       credentialId: server.credential_id?.toString() || "",
       folderId: server.folder_id?.toString() || "",
+      keyId: server.key_id?.toString() || "",
       proxyType: server.proxy_type || "none",
       proxyHost: server.proxy_host || "",
       proxyPort: server.proxy_port || 1080,
@@ -205,8 +291,8 @@ function DesktopApp() {
   const TitleBar = () => (
     <div data-tauri-drag-region className="h-10 bg-[#0d0d10] border-b border-white/5 flex items-center justify-between px-3 select-none shrink-0 z-50 drag absolute top-0 left-0 right-0">
       <div className="flex items-center gap-2 pr-4 pl-[75px] md:pl-2" data-tauri-drag-region>
-        <div className="w-6 h-6 bg-primary/10 text-primary rounded-lg flex items-center justify-center font-black border border-primary/20 text-[12px]">Ω</div>
-        <span className="text-[11px] font-black text-white uppercase tracking-[0.2em]">Omni</span>
+        <img src={logoUrl} alt="" draggable={false} className="w-6 h-6 select-none" />
+        <span className="text-[12px] font-bold text-white tracking-tight">Submarine</span>
       </div>
       
       <div className="flex-1 flex gap-1 overflow-x-auto no-scrollbar h-full items-end pb-1" data-tauri-drag-region>
@@ -214,10 +300,10 @@ function DesktopApp() {
           <div
             key={s.id}
             onClick={() => setActiveView(s.id)}
-            className={`group no-drag flex items-center h-7 px-4 rounded-full cursor-pointer transition-all min-w-[100px] max-w-[180px] mr-1 ${activeView === s.id ? 'bg-primary text-black shadow-lg shadow-primary/20' : 'bg-white/5 text-zinc-500 hover:bg-white/10'}`}
+            className={`group no-drag flex items-center h-7 px-4 rounded-full cursor-pointer transition-all min-w-[100px] max-w-[180px] mr-1 ${activeView === s.id ? 'bg-primary/15 text-primary border border-primary/40 shadow-inner shadow-primary/10' : 'bg-white/[0.06] text-zinc-300 border border-white/10 hover:bg-white/[0.1] hover:border-white/20 hover:text-white'}`}
           >
             <span className="text-[10px] font-bold truncate flex-1 uppercase tracking-tight">{s.serverName}</span>
-            <X size={10} className="ml-2 opacity-0 group-hover:opacity-100 hover:text-red-500" onClick={(e) => { e.stopPropagation(); setSessions(sessions.filter(sess => sess.id !== s.id)); if (activeView === s.id) setActiveView("nodes"); }} />
+            <X size={10} className="ml-2 opacity-0 group-hover:opacity-100 hover:text-red-500" onClick={(e) => { e.stopPropagation(); setSessions(prev => prev.filter(sess => sess.id !== s.id)); setActiveView(prev => (prev === s.id ? "nodes" : prev)); }} />
           </div>
         ))}
       </div>
@@ -228,21 +314,16 @@ function DesktopApp() {
     </div>
   );
 
-  if (loading) return <div className="h-screen bg-black flex items-center justify-center font-mono text-xs text-primary animate-pulse">INITIALIZING OMNI</div>;
+  if (loading) return <div className="h-screen bg-black flex items-center justify-center font-mono text-xs text-primary animate-pulse">Loading…</div>;
 
   return (
     <div className="h-screen w-full bg-background flex flex-col overflow-hidden text-zinc-200 select-none">
       <TitleBar />
       {!isUnlocked ? (
-        <AuthPage
-          dbExists={dbExists} password={password} setPassword={setPassword}
-          confirmPassword={confirmPassword} setConfirmPassword={setConfirmPassword}
-          error={error} handleAuth={handleAuth} handleReset={() => invoke("reset_db").then(() => window.location.reload())}
-          showResetConfirm={showResetConfirm} setShowResetConfirm={setShowResetConfirm}
-        />
+        <ProfileSelectPage onUnlocked={handleProfileUnlocked} />
       ) : (
         <div className="flex-1 flex overflow-hidden pt-10">
-          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} />
+          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} />
 
           <main className="flex-1 flex flex-col min-w-0 bg-transparent">
             {activeView === "nodes" && (
@@ -252,6 +333,7 @@ function DesktopApp() {
                 onOpenServer={openServer}
                 onEditServer={handleEditNode}
                 onAddClick={() => { setNewNode(defaultNode); setIsPanelOpen(true); }}
+                onQuickConnect={() => setIsQuickConnectOpen(true)}
                 onRemoveServer={removeServer}
                 onRemoveFolder={removeFolder}
                 isMobile={isMobile}
@@ -267,45 +349,48 @@ function DesktopApp() {
             )}
 
             {activeView === "vault" && (
-              <div className="flex-1 flex flex-col p-8 space-y-8 animate-in overflow-y-auto custom-scrollbar">
-                <header className="flex justify-between items-center border-b border-zinc-700 pb-6 shrink-0">
-                  <div>
-                    <h2 className="text-[22px] font-bold text-white uppercase tracking-tight">Identity Vault</h2>
-                    <p className="text-[14px] text-zinc-400 font-medium">Security Credentials & Keys</p>
+              <div className="flex-1 flex flex-col p-4 sm:p-8 space-y-6 sm:space-y-8 animate-in overflow-y-auto custom-scrollbar">
+                <header className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 border-b border-zinc-700 pb-5 sm:pb-6 shrink-0">
+                  <div className="min-w-0">
+                    <h2 className="text-[18px] sm:text-[22px] font-bold text-white tracking-tight">Logins</h2>
+                    <p className="hidden sm:block text-[13px] text-zinc-400">Your saved passwords and SSH keys.</p>
                   </div>
-                  <div className="flex gap-2">
-                    <button 
+                  <div className="flex flex-wrap gap-2">
+                    <button
                       onClick={() => { setEditCredData({ id: null, name: "", auth_type: "password", username: "", password: "", key_id: null }); setIsCredPanelOpen(true); }}
-                      className="h-9 px-4 bg-zinc-900 text-zinc-200 text-[13px] font-bold rounded-xl border border-white/5 hover:bg-zinc-800 transition-all flex items-center gap-2"
+                      title="Add Password"
+                      className="h-9 px-2.5 sm:px-4 bg-zinc-900 text-zinc-200 text-[12px] sm:text-[13px] font-bold rounded-xl border border-white/5 hover:bg-zinc-800 transition-all flex items-center gap-1.5"
                     >
-                      <Plus size={14} /> Add Password
+                      <Plus size={14} /> <span className="hidden sm:inline">Add Password</span><span className="sm:hidden">Password</span>
                     </button>
-                    <button 
+                    <button
                       onClick={() => { setEditKeyData({ id: null, name: "", public_key: "", private_key: "", passphrase: "" }); setIsKeyPanelOpen(true); }}
-                      className="h-9 px-4 bg-zinc-900 text-zinc-200 text-[13px] font-bold rounded-xl border border-white/5 hover:bg-zinc-800 transition-all flex items-center gap-2"
+                      title="Add Key"
+                      className="h-9 px-2.5 sm:px-4 bg-zinc-900 text-zinc-200 text-[12px] sm:text-[13px] font-bold rounded-xl border border-white/5 hover:bg-zinc-800 transition-all flex items-center gap-1.5"
                     >
-                      <Plus size={14} /> Add Key
+                      <Plus size={14} /> <span className="hidden sm:inline">Add Key</span><span className="sm:hidden">Key</span>
                     </button>
-                    <button 
+                    <button
                       onClick={() => {
                         const name = window.prompt("Enter a name for the new SSH key:");
-                        if (name) invoke("generate_ssh_key", { name }).then(() => refreshData());
-                      }} 
-                      className="h-9 px-4 bg-primary text-black text-[13px] font-bold rounded-xl shadow-lg shadow-primary/20 flex items-center gap-2"
+                        if (name) invoke("generate_ssh_key", { name }).then(() => refreshSshKeys());
+                      }}
+                      title="Generate Key"
+                      className="h-9 px-2.5 sm:px-4 bg-primary text-black text-[12px] sm:text-[13px] font-bold rounded-xl shadow-lg shadow-primary/20 flex items-center gap-1.5"
                     >
-                      <Key size={14} /> Generate Key
+                      <Key size={14} /> <span className="hidden sm:inline">Generate Key</span><span className="sm:hidden">Generate</span>
                     </button>
                   </div>
                 </header>
 
                 <div className="space-y-10 pb-10">
                   <section>
-                    <h3 className="text-[12px] font-black text-zinc-500 uppercase tracking-[0.2em] mb-4 flex items-center gap-2">
-                      <Shield size={14} /> Saved Credentials
+                    <h3 className="text-[13px] font-bold text-zinc-400 mb-4 flex items-center gap-2">
+                      <Shield size={14} /> Saved passwords
                     </h3>
                     <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2">
                       {credentials.length === 0 ? (
-                        <div className="col-span-full py-10 text-center text-zinc-600 text-[14px] italic border border-dashed border-white/5 rounded-2xl">No passwords saved.</div>
+                        <div className="col-span-full py-10 text-center text-zinc-600 text-[14px] italic border border-dashed border-white/5 rounded-2xl">Nothing here yet.</div>
                       ) : (
                         credentials.map(c => (
                           <div key={c.id} className="bg-[#16161a] border border-white/5 rounded-xl p-3 group relative hover:border-primary/30 transition-all">
@@ -313,15 +398,15 @@ function DesktopApp() {
                               <h4 className="text-[14px] font-bold text-zinc-100 truncate pr-8">{c.name}</h4>
                               <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity absolute right-3 top-3">
                                 <button onClick={() => { setEditCredData(c); setIsCredPanelOpen(true); }} className="text-zinc-500 hover:text-white"><Edit2 size={14} /></button>
-                                <button onClick={() => invoke("delete_credential", { id: c.id }).then(() => refreshData())} className="text-zinc-500 hover:text-red-500"><Trash2 size={14} /></button>
+                                <button onClick={() => invoke("delete_credential", { id: c.id }).then(() => refreshCredentials())} className="text-zinc-500 hover:text-red-500"><Trash2 size={14} /></button>
                               </div>
                             </div>
                             <div className="flex flex-col gap-0.5">
-                              <div className="flex items-center gap-2 text-[11px] text-zinc-500 uppercase font-bold">
+                              <div className="flex items-center gap-2 text-[11px] text-zinc-500 font-medium">
                                 <User size={10} /> {c.username}
                               </div>
-                              <div className="flex items-center gap-2 text-[11px] text-zinc-500 uppercase font-bold">
-                                <Key size={10} /> {c.password ? "••••••••" : "Key Linked"}
+                              <div className="flex items-center gap-2 text-[11px] text-zinc-500 font-medium">
+                                <Key size={10} /> {c.password ? "••••••••" : "Using SSH key"}
                               </div>
                             </div>
                           </div>
@@ -331,28 +416,28 @@ function DesktopApp() {
                   </section>
 
                   <section>
-                    <h3 className="text-[12px] font-black text-zinc-500 uppercase tracking-[0.2em] mb-4 flex items-center gap-2">
-                      <Key size={14} /> SSH Keys
+                    <h3 className="text-[13px] font-bold text-zinc-400 mb-4 flex items-center gap-2">
+                      <Key size={14} /> SSH keys
                     </h3>
                     <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-2">
                       {sshKeys.length === 0 ? (
-                        <div className="col-span-full py-10 text-center text-zinc-600 text-[14px] italic border border-dashed border-white/5 rounded-2xl">No SSH keys saved.</div>
+                        <div className="col-span-full py-10 text-center text-zinc-600 text-[14px] italic border border-dashed border-white/5 rounded-2xl">No keys saved yet.</div>
                       ) : (
-                        sshKeys.map(k => (
+                        sshKeys.map((k: any) => (
                           <div key={k.id} className="bg-[#16161a] border border-white/5 rounded-xl p-3 group relative hover:border-primary/30 transition-all">
                             <div className="flex justify-between items-start mb-1">
                               <h4 className="text-[14px] font-bold text-zinc-100 truncate pr-8">{k.name}</h4>
                               <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity absolute right-3 top-3">
                                 <button onClick={() => { setEditKeyData(k); setIsKeyPanelOpen(true); }} className="text-zinc-500 hover:text-white"><Edit2 size={14} /></button>
-                                <button onClick={() => invoke("delete_ssh_key", { id: k.id }).then(() => refreshData())} className="text-zinc-500 hover:text-red-500"><Trash2 size={14} /></button>
+                                <button onClick={() => invoke("delete_ssh_key", { id: k.id }).then(() => refreshSshKeys())} className="text-zinc-500 hover:text-red-500"><Trash2 size={14} /></button>
                               </div>
                             </div>
                             <div className="flex flex-col gap-0.5">
                               <div className="flex items-center gap-2 text-[10px] text-zinc-500 font-mono truncate">
                                 {k.public_key.substring(0, 24)}...
                               </div>
-                              <div className="text-[10px] text-primary/40 font-black uppercase tracking-widest">
-                                RSA SECURED
+                              <div className="text-[10px] text-primary/50 font-medium">
+                                Private key
                               </div>
                             </div>
                           </div>
@@ -366,27 +451,36 @@ function DesktopApp() {
 
             {sessions.map(sess => (
               <div key={sess.id} className={`flex-1 flex flex-col overflow-hidden ${activeView === sess.id ? '' : 'hidden'}`}>
-                <SessionView 
-                  session={sess} 
-                  onClose={() => {
-                    setSessions(sessions.filter(s => s.id !== sess.id));
+                <ErrorBoundary
+                  label={sess.serverName}
+                  onReset={() => {
+                    setSessions(prev => prev.filter(s => s.id !== sess.id));
                     if (activeView === sess.id) setActiveView("nodes");
                   }}
-                  addLog={addLog}
-                />
+                >
+                  <SessionView
+                    session={sess}
+                    onClose={() => {
+                      setSessions(prev => prev.filter(s => s.id !== sess.id));
+                      setActiveView(prev => (prev === sess.id ? "nodes" : prev));
+                    }}
+                    addLog={addLog}
+                  />
+                </ErrorBoundary>
               </div>
             ))}
 
             {activeView === "commands" && (
-              <div className="flex-1 flex flex-col p-8 space-y-6 animate-in overflow-y-auto custom-scrollbar">
-                <header className="flex justify-between items-center border-b border-zinc-700 pb-6 shrink-0">
-                  <div>
-                    <h2 className="text-[22px] font-bold text-white uppercase tracking-tight">Saved Commands</h2>
-                    <p className="text-[14px] text-zinc-400 font-medium">Manage reusable terminal scripts</p>
+              <div className="flex-1 flex flex-col p-4 sm:p-8 space-y-5 sm:space-y-6 animate-in overflow-y-auto custom-scrollbar">
+                <header className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 border-b border-zinc-700 pb-5 sm:pb-6 shrink-0">
+                  <div className="min-w-0">
+                    <h2 className="text-[18px] sm:text-[22px] font-bold text-white tracking-tight">Commands</h2>
+                    <p className="hidden sm:block text-[13px] text-zinc-400">Snippets you can paste into a terminal.</p>
                   </div>
-                  <button 
-                    onClick={() => { setEditCommandData({ id: null, title: "", content: "" }); setIsCommandPanelOpen(true); }} 
-                    className="h-9 px-4 bg-primary text-black text-[13px] font-bold rounded-xl shadow-lg shadow-primary/20 flex items-center gap-2 transition-all hover:bg-primary"
+                  <button
+                    onClick={() => { setEditCommandData({ id: null, title: "", content: "" }); setIsCommandPanelOpen(true); }}
+                    title="Add Command"
+                    className="h-9 px-3 sm:px-4 bg-primary text-black text-[12px] sm:text-[13px] font-bold rounded-xl shadow-lg shadow-primary/20 flex items-center gap-1.5 transition-all hover:bg-primary self-start sm:self-auto"
                   >
                     <Plus size={14} /> Add Command
                   </button>
@@ -395,7 +489,7 @@ function DesktopApp() {
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pb-10">
                   {commands.length === 0 ? (
                     <div className="col-span-full py-12 text-center text-zinc-500 text-[14px] italic border border-dashed border-white/10 rounded-2xl">
-                      No saved commands yet.
+                      No commands yet.
                     </div>
                   ) : (
                     commands.map(cmd => (
@@ -404,7 +498,7 @@ function DesktopApp() {
                           <h3 className="text-[16px] font-bold text-primary tracking-tight">{cmd.title}</h3>
                           <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
                             <button onClick={() => { setEditCommandData(cmd); setIsCommandPanelOpen(true); }} className="text-zinc-500 hover:text-white transition-colors"><Edit2 size={14} /></button>
-                            <button onClick={() => invoke("delete_command", { id: cmd.id }).then(() => refreshData())} className="text-zinc-500 hover:text-red-500 transition-colors"><Trash2 size={14} /></button>
+                            <button onClick={() => invoke("delete_command", { id: cmd.id }).then(() => refreshCommands())} className="text-zinc-500 hover:text-red-500 transition-colors"><Trash2 size={14} /></button>
                           </div>
                         </div>
                         <div className="bg-black/30 rounded-xl p-3 border border-white/5 flex-1 relative group-hover:border-primary/20 transition-colors overflow-hidden">
@@ -417,26 +511,36 @@ function DesktopApp() {
               </div>
             )}
 
+            {/* Monitor is mounted permanently and just CSS-hidden when not
+                active. Unmounting would tear down the sample/history ring
+                buffers, the per-node event listeners, and the 1s tick — so
+                switching tabs felt like monitoring "stopped". Keeping it
+                mounted preserves the live data; the backend pollers were
+                always running, only the UI side was losing state. */}
+            <div className={`flex-1 flex flex-col overflow-hidden ${activeView === "monitor" ? "" : "hidden"}`}>
+              <MonitoringPanel servers={servers} refreshServers={refreshServers} addLog={addLog} />
+            </div>
+
             {activeView === "logs" && (
-              <div className="flex-1 flex flex-col p-8 space-y-6 animate-in overflow-hidden">
-                <header className="flex justify-between items-center border-b border-zinc-700 pb-6 shrink-0">
-                  <div>
-                    <h2 className="text-[22px] font-bold text-white uppercase tracking-tight">System Logs</h2>
-                    <p className="text-[14px] text-zinc-400 font-medium">Application event history</p>
+              <div className="flex-1 flex flex-col p-4 sm:p-8 space-y-5 sm:space-y-6 animate-in overflow-hidden">
+                <header className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 border-b border-zinc-700 pb-5 sm:pb-6 shrink-0">
+                  <div className="min-w-0">
+                    <h2 className="text-[18px] sm:text-[22px] font-bold text-white tracking-tight">Activity</h2>
+                    <p className="hidden sm:block text-[13px] text-zinc-400">What the app has been doing.</p>
                   </div>
-                  <button onClick={() => setLogs([])} className="h-9 px-4 bg-zinc-900 text-zinc-200 text-[13px] font-bold rounded-xl border border-white/5 hover:bg-red-500/20 hover:text-red-400 hover:border-primary/50 transition-all flex items-center gap-2">
-                    <Trash2 size={14} /> Clear Logs
+                  <button onClick={() => setLogs([])} className="h-9 px-3 sm:px-4 bg-zinc-900 text-zinc-200 text-[12px] sm:text-[13px] font-bold rounded-xl border border-white/5 hover:bg-red-500/20 hover:text-red-400 hover:border-primary/50 transition-all flex items-center gap-1.5 self-start sm:self-auto">
+                    <Trash2 size={14} /> Clear
                   </button>
                 </header>
 
                 <div className="flex-1 overflow-y-auto custom-scrollbar bg-black/50 rounded-2xl border border-white/5 p-4 space-y-1 shadow-inner">
                   {logs.length === 0 ? (
                     <div className="h-full flex items-center justify-center text-zinc-600 text-[14px] font-mono italic">
-                      System logs are empty.
+                      Nothing yet.
                     </div>
                   ) : (
-                    [...logs].reverse().map((log, i) => (
-                      <div key={i} className="flex items-start gap-3 text-[12px] font-mono group hover:bg-white/5 p-1 rounded-md transition-colors">
+                    [...logs].reverse().map((log) => (
+                      <div key={(log as any).id ?? `${log.time}-${log.msg}`} className="flex items-start gap-3 text-[12px] font-mono group hover:bg-white/5 p-1 rounded-md transition-colors">
                         <span className="text-zinc-600 shrink-0 w-20">{log.time}</span>
                         <span className={`shrink-0 w-24 font-bold uppercase ${log.type === 'error' ? 'text-red-500' : log.type === 'success' ? 'text-primary' : log.type === 'warn' ? 'text-amber-500' : 'text-blue-500'}`}>
                           [{log.type}]
@@ -463,12 +567,39 @@ function DesktopApp() {
             addLog("Name and Host are required.", "error");
             return;
           }
+          if (newNode.authType === "vault" && !newNode.credentialId) {
+            setFormError("Please pick a saved login.");
+            addLog("Please pick a saved login.", "error");
+            return;
+          }
+          if (newNode.authType === "custom_key" && !newNode.keyId) {
+            setFormError("Please pick an SSH key.");
+            addLog("Please pick an SSH key.", "error");
+            return;
+          }
           try {
+            // Identity fields are only meaningful for inline (custom_*) modes;
+            // in vault mode the credential owns username/password/key and we
+            // send nulls so the DB row matches reality. The backend's
+            // `normalize_server_identity` enforces this again on the server
+            // side as a belt-and-suspenders guarantee.
+            const isInline = newNode.authType === "custom_pass" || newNode.authType === "custom_key";
             const payload = {
-              ...newNode,
-              credentialId: newNode.credentialId ? parseInt(newNode.credentialId) : null,
+              name: newNode.name,
+              host: newNode.host,
+              port: newNode.port,
+              username: isInline
+                ? (newNode.username?.trim() ? newNode.username.trim() : "root")
+                : null,
+              password: newNode.authType === "custom_pass" ? (newNode.password || null) : null,
+              credentialId: (newNode.authType === "vault" && newNode.credentialId) ? parseInt(newNode.credentialId) : null,
               folderId: newNode.folderId ? parseInt(newNode.folderId) : null,
-              password: newNode.authType === "custom_pass" ? (newNode.password || null) : null
+              proxyType: newNode.proxyType || "none",
+              proxyHost: newNode.proxyHost || "",
+              proxyPort: newNode.proxyPort || 1080,
+              tunnels: newNode.tunnels || [],
+              authType: newNode.authType,
+              keyId: newNode.authType === "custom_key" && newNode.keyId ? parseInt(newNode.keyId) : null,
             };
             const action = newNode.id 
               ? invoke("edit_server", { id: newNode.id, ...payload }) 
@@ -477,7 +608,7 @@ function DesktopApp() {
             await action;
             setIsPanelOpen(false);
             setFormError("");
-            refreshData();
+            refreshServers();
             addLog(`Node ${newNode.id ? 'updated' : 'added'} successfully.`, "success");
           } catch (e) {
             setFormError(`Failed to save: ${e}`);
@@ -485,16 +616,23 @@ function DesktopApp() {
           }
         }}
         formError={formError}
-        credentials={credentials} sshKeys={sshKeys} folders={folders} refreshData={refreshData}
+        credentials={credentials} sshKeys={sshKeys} folders={folders} refreshFolders={refreshFolders}
         isMobile={isMobile}
       />
+
+      <QuickConnectModal
+        isOpen={isQuickConnectOpen}
+        onClose={() => setIsQuickConnectOpen(false)}
+        onConnect={openQuickConnect}
+      />
+
 
       <div className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCommandPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsCommandPanelOpen(false)}>
         <div className={`w-full max-w-[400px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col ${isCommandPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
-            <h2 className="text-[16px] font-black text-white uppercase tracking-widest flex items-center gap-2">
+            <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <TerminalSquare size={18} className="text-primary" />
-              {editCommandData.id ? "Edit Command" : "New Command"}
+              {editCommandData.id ? "Edit command" : "New command"}
             </h2>
             <button onClick={() => { setIsCommandPanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
               <X size={16} />
@@ -503,11 +641,11 @@ function DesktopApp() {
           <div className="p-6 flex-1 overflow-y-auto space-y-6">
             {formError && <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[12px] font-bold">{formError}</div>}
             <div className="space-y-1.5">
-              <label className="text-[12px] font-bold text-zinc-400 uppercase tracking-wider ml-1">Title</label>
-              <input type="text" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner" placeholder="e.g. Update System" value={editCommandData.title} onChange={e => setEditCommandData({ ...editCommandData, title: e.target.value })} />
+              <label className="text-[12px] font-bold text-zinc-400 ml-1">Title</label>
+              <input type="text" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner" placeholder="e.g. Update packages" value={editCommandData.title} onChange={e => setEditCommandData({ ...editCommandData, title: e.target.value })} />
             </div>
             <div className="space-y-1.5 flex-1 flex flex-col h-64">
-              <label className="text-[12px] font-bold text-zinc-400 uppercase tracking-wider ml-1">Script Content</label>
+              <label className="text-[12px] font-bold text-zinc-400 ml-1">Command</label>
               <textarea className="w-full flex-1 bg-black rounded-lg p-3 text-[13px] text-zinc-300 font-mono border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner custom-scrollbar resize-none" placeholder="sudo apt update && sudo apt upgrade -y" value={editCommandData.content} onChange={e => setEditCommandData({ ...editCommandData, content: e.target.value })} />
             </div>
           </div>
@@ -524,16 +662,16 @@ function DesktopApp() {
                     : invoke("add_command", { title: editCommandData.title, content: editCommandData.content });
                   await action;
                   setIsCommandPanelOpen(false);
-                  refreshData();
+                  refreshCommands();
                   addLog("Command saved.", "success");
                 } catch (e) {
                   setFormError(`Failed to save command: ${e}`);
                   addLog(`COMMAND_SAVE_ERROR: ${e}`, "error");
                 }
               }} 
-              className="w-full h-10 bg-primary text-black font-black rounded-lg uppercase text-[13px] tracking-wider hover:bg-primary transition-all active:scale-[0.98] shadow-[0_0_15px_rgba(var(--primary),0.2)] flex items-center justify-center gap-2"
+              className="w-full h-10 bg-primary text-black font-bold rounded-lg text-[13px] tracking-tight hover:bg-primary transition-all active:scale-[0.98] shadow-[0_0_15px_rgba(var(--primary),0.2)] flex items-center justify-center gap-2"
             >
-              Save Command
+              Save
             </button>
           </div>
         </div>
@@ -542,9 +680,9 @@ function DesktopApp() {
       <div className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isCredPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsCredPanelOpen(false)}>
         <div className={`w-full max-w-[400px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col ${isCredPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
-            <h2 className="text-[16px] font-black text-white uppercase tracking-widest flex items-center gap-2">
+            <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <Shield size={18} className="text-primary" />
-              {editCredData.id ? "Edit Credential" : "New Credential"}
+              {editCredData.id ? "Edit login" : "New login"}
             </h2>
             <button onClick={() => { setIsCredPanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
               <X size={16} />
@@ -553,49 +691,87 @@ function DesktopApp() {
           <div className="p-6 flex-1 overflow-y-auto space-y-6">
             {formError && <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[12px] font-bold">{formError}</div>}
             <div className="space-y-1.5">
-              <label className="text-[12px] font-bold text-zinc-400 uppercase tracking-wider ml-1">Name</label>
-              <input type="text" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner" placeholder="e.g. My Server" value={editCredData.name} onChange={e => setEditCredData({ ...editCredData, name: e.target.value })} />
+              <label className="text-[12px] font-bold text-zinc-400 ml-1">Name</label>
+              <input type="text" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner" placeholder="e.g. Work server" value={editCredData.name} onChange={e => setEditCredData({ ...editCredData, name: e.target.value })} />
             </div>
             <div className="space-y-1.5">
-              <label className="text-[12px] font-bold text-zinc-400 uppercase tracking-wider ml-1">Username</label>
+              <label className="text-[12px] font-bold text-zinc-400 ml-1">Username</label>
               <input type="text" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner" placeholder="root" value={editCredData.username} onChange={e => setEditCredData({ ...editCredData, username: e.target.value })} />
             </div>
-            <div className="space-y-1.5">
-              <label className="text-[12px] font-bold text-zinc-400 uppercase tracking-wider ml-1">Password</label>
-              <input type="password" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner" value={editCredData.password || ""} onChange={e => setEditCredData({ ...editCredData, password: e.target.value })} />
+            <div className="space-y-4 pt-2">
+              <div className="flex justify-between items-center">
+                <label className="text-[12px] font-bold text-zinc-400 ml-1">Sign in with</label>
+                <select
+                  className="bg-transparent text-[12px] font-bold text-primary outline-none cursor-pointer"
+                  value={editCredData.auth_type || "password"}
+                  onChange={e => setEditCredData({ ...editCredData, auth_type: e.target.value })}
+                >
+                  <option value="password" className="bg-[#121215] text-primary">Password</option>
+                  <option value="key" className="bg-[#121215] text-primary">SSH key</option>
+                </select>
+              </div>
             </div>
+            {editCredData.auth_type === "key" ? (
+              <div className="space-y-1.5 animate-in fade-in">
+                <label className="text-[12px] font-bold text-zinc-400 ml-1">Pick a key</label>
+                <select
+                  className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
+                  value={editCredData.key_id?.toString() || ""}
+                  onChange={e => setEditCredData({ ...editCredData, key_id: e.target.value ? parseInt(e.target.value) : null })}
+                >
+                  <option value="" className="bg-black text-zinc-500">-- Pick a key --</option>
+                  {sshKeys?.map((k: any) => (
+                    <option key={k.id} value={k.id.toString()} className="bg-black text-white">{k.name}</option>
+                  ))}
+                </select>
+              </div>
+            ) : (
+              <div className="space-y-1.5 animate-in fade-in">
+                <label className="text-[12px] font-bold text-zinc-400 ml-1">Password</label>
+                <PasswordField
+                  value={editCredData.password || ""}
+                  onChange={(v) => setEditCredData({ ...editCredData, password: v })}
+                  className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner"
+                />
+              </div>
+            )}
           </div>
           <div className="p-6 border-t border-white/5 shrink-0">
             <button 
               onClick={async () => {
-                if (!editCredData.name || !editCredData.username) {
-                  addLog("Name and Username are required.", "error");
+                if (!editCredData.name) {
+                  setFormError("Name is required.");
+                  addLog("Name is required.", "error");
+                  return;
+                }
+                if (editCredData.auth_type === "key" && !editCredData.key_id) {
+                  setFormError("Please select a linked SSH Private Key.");
+                  addLog("Please select a linked SSH Private Key.", "error");
                   return;
                 }
                 try {
                   const payload = {
-                    id: editCredData.id,
                     name: editCredData.name,
-                    authType: editCredData.auth_type,
-                    username: editCredData.username,
-                    password: editCredData.password,
-                    keyId: editCredData.key_id
+                    authType: editCredData.auth_type || "password",
+                    username: editCredData.username?.trim() ? editCredData.username.trim() : "root",
+                    password: editCredData.auth_type === "key" ? null : (editCredData.password || null),
+                    keyId: editCredData.auth_type === "key" ? (editCredData.key_id ? parseInt(editCredData.key_id.toString()) : null) : null
                   };
                   const action = editCredData.id 
-                    ? invoke("edit_credential", payload)
-                    : invoke("add_credential", { ...payload });
+                    ? invoke("edit_credential", { id: editCredData.id, ...payload })
+                    : invoke("add_credential", payload);
                   await action;
                   setIsCredPanelOpen(false);
-                  refreshData();
+                  refreshCredentials();
                   addLog("Credential saved.", "success");
                 } catch (e) {
                   setFormError(`Failed to save credential: ${e}`);
                   addLog(`CRED_SAVE_ERROR: ${e}`, "error");
                 }
               }} 
-              className="w-full h-10 bg-primary text-black font-black rounded-lg uppercase text-[13px] tracking-wider hover:bg-primary transition-all active:scale-[0.98] flex items-center justify-center gap-2"
+              className="w-full h-10 bg-primary text-black font-bold rounded-lg text-[13px] tracking-tight hover:bg-primary transition-all active:scale-[0.98] flex items-center justify-center gap-2"
             >
-              Save Credential
+              Save
             </button>
           </div>
         </div>
@@ -604,9 +780,9 @@ function DesktopApp() {
       <div className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isKeyPanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsKeyPanelOpen(false)}>
         <div className={`w-full max-w-[450px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col ${isKeyPanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
-            <h2 className="text-[16px] font-black text-white uppercase tracking-widest flex items-center gap-2">
+            <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
               <Key size={18} className="text-primary" />
-              {editKeyData.id ? "Edit SSH Key" : "New SSH Key"}
+              {editKeyData.id ? "Edit SSH key" : "New SSH key"}
             </h2>
             <button onClick={() => { setIsKeyPanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
               <X size={16} />
@@ -615,20 +791,24 @@ function DesktopApp() {
           <div className="p-6 flex-1 overflow-y-auto space-y-6">
             {formError && <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[12px] font-bold">{formError}</div>}
             <div className="space-y-1.5">
-              <label className="text-[12px] font-bold text-zinc-400 uppercase tracking-wider ml-1">Name</label>
-              <input type="text" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary-500/50 focus:bg-zinc-900/50 transition-all shadow-inner" placeholder="e.g. My SSH Key" value={editKeyData.name} onChange={e => setEditKeyData({ ...editKeyData, name: e.target.value })} />
+              <label className="text-[12px] font-bold text-zinc-400 ml-1">Name</label>
+              <input type="text" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary-500/50 focus:bg-zinc-900/50 transition-all shadow-inner" placeholder="e.g. My laptop key" value={editKeyData.name} onChange={e => setEditKeyData({ ...editKeyData, name: e.target.value })} />
             </div>
             <div className="space-y-1.5">
-              <label className="text-[12px] font-bold text-zinc-400 uppercase tracking-wider ml-1">Public Key</label>
+              <label className="text-[12px] font-bold text-zinc-400 ml-1">Public key</label>
               <textarea className="w-full h-24 bg-black rounded-lg p-3 text-[13px] text-zinc-400 font-mono border border-white/10 outline-none focus:border-primary-500/50 focus:bg-zinc-900/50 transition-all shadow-inner custom-scrollbar resize-none" placeholder="ssh-ed25519 ..." value={editKeyData.public_key} onChange={e => setEditKeyData({ ...editKeyData, public_key: e.target.value })} />
             </div>
             <div className="space-y-1.5">
-              <label className="text-[12px] font-bold text-zinc-400 uppercase tracking-wider ml-1">Private Key (Masked)</label>
+              <label className="text-[12px] font-bold text-zinc-400 ml-1">Private key</label>
               <textarea className="w-full h-32 bg-black rounded-lg p-3 text-[13px] text-zinc-400 font-mono border border-white/10 outline-none focus:border-primary-500/50 focus:bg-zinc-900/50 transition-all shadow-inner custom-scrollbar resize-none" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" value={editKeyData.private_key} onChange={e => setEditKeyData({ ...editKeyData, private_key: e.target.value })} />
             </div>
             <div className="space-y-1.5">
-              <label className="text-[12px] font-bold text-zinc-400 uppercase tracking-wider ml-1">Passphrase</label>
-              <input type="password" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary-500/50 focus:bg-zinc-900/50 transition-all shadow-inner" value={editKeyData.passphrase || ""} onChange={e => setEditKeyData({ ...editKeyData, passphrase: e.target.value })} />
+              <label className="text-[12px] font-bold text-zinc-400 ml-1">Passphrase (if any)</label>
+              <PasswordField
+                value={editKeyData.passphrase || ""}
+                onChange={(v) => setEditKeyData({ ...editKeyData, passphrase: v })}
+                className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary-500/50 focus:bg-zinc-900/50 transition-all shadow-inner"
+              />
             </div>
           </div>
           <div className="p-6 border-t border-white/5 shrink-0">
@@ -640,27 +820,26 @@ function DesktopApp() {
                 }
                 try {
                   const payload = {
-                    id: editKeyData.id,
                     name: editKeyData.name,
                     publicKey: editKeyData.public_key,
                     privateKey: editKeyData.private_key,
-                    passphrase: editKeyData.passphrase
+                    passphrase: editKeyData.passphrase || null
                   };
                   const action = editKeyData.id 
-                    ? invoke("edit_ssh_key", payload)
-                    : invoke("add_ssh_key", { ...payload });
+                    ? invoke("edit_ssh_key", { id: editKeyData.id, ...payload })
+                    : invoke("add_ssh_key", payload);
                   await action;
                   setIsKeyPanelOpen(false);
-                  refreshData();
+                  refreshSshKeys();
                   addLog("SSH Key saved.", "success");
                 } catch (e) {
                   setFormError(`Failed to save SSH Key: ${e}`);
                   addLog(`KEY_SAVE_ERROR: ${e}`, "error");
                 }
               }} 
-              className="w-full h-10 bg-primary text-black font-black rounded-lg uppercase text-[13px] tracking-wider hover:bg-primary transition-all active:scale-[0.98] flex items-center justify-center gap-2"
+              className="w-full h-10 bg-primary text-black font-bold rounded-lg text-[13px] tracking-tight hover:bg-primary transition-all active:scale-[0.98] flex items-center justify-center gap-2"
             >
-              Save SSH Key
+              Save
             </button>
           </div>
         </div>

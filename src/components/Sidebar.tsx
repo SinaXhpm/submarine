@@ -1,11 +1,12 @@
-import { Server, KeyRound, TerminalSquare, List, Settings } from "lucide-react";
+import { Server, KeyRound, TerminalSquare, Activity, List, Settings, LogOut } from "lucide-react";
 
-export const Sidebar = ({ activeTab, setActiveTab, isMobile }: any) => {
+export const Sidebar = ({ activeTab, setActiveTab, isMobile, onLogout }: any) => {
   const items = [
-    { id: 'nodes', icon: Server, label: 'Nodes' },
-    { id: 'vault', icon: KeyRound, label: 'Vault' },
-    { id: 'commands', icon: TerminalSquare, label: 'CMDS' },
-    { id: 'logs', icon: List, label: 'Logs' },
+    { id: 'nodes', icon: Server, label: 'Servers' },
+    { id: 'vault', icon: KeyRound, label: 'Logins' },
+    { id: 'commands', icon: TerminalSquare, label: 'Commands' },
+    { id: 'monitor', icon: Activity, label: 'Monitor' },
+    { id: 'logs', icon: List, label: 'Activity' },
   ];
 
   return (
@@ -28,17 +29,32 @@ export const Sidebar = ({ activeTab, setActiveTab, isMobile }: any) => {
         ))}
       </nav>
 
-      <button 
-        onClick={() => setActiveTab('settings')}
-        className={`mt-auto p-2.5 rounded-xl transition-all flex items-center justify-center ${
-          activeTab === 'settings' 
-            ? 'text-primary bg-primary/10 shadow-[0_0_20px_rgba(var(--primary),0.15)]' 
-            : 'text-zinc-600 hover:text-zinc-200 hover:bg-white/5'
-        }`}
-        title="Settings"
-      >
-        <Settings size={20} className={activeTab === 'settings' ? "drop-shadow-[0_0_8px_rgba(var(--primary),0.5)]" : ""} />
-      </button>
+      {/* Bottom cluster: logout (lock current profile, return to picker)
+          and settings. Logout sits above settings so the gear stays as the
+          last-most icon — matches the muscle memory from when it was the
+          only bottom action. */}
+      <div className="mt-auto w-full px-2 flex flex-col gap-2">
+        {onLogout && (
+          <button
+            onClick={onLogout}
+            className="p-2.5 rounded-xl transition-all flex items-center justify-center text-zinc-300 hover:text-amber-300 hover:bg-amber-500/10"
+            title="Lock & switch profile"
+          >
+            <LogOut size={18} />
+          </button>
+        )}
+        <button
+          onClick={() => setActiveTab('settings')}
+          className={`p-2.5 rounded-xl transition-all flex items-center justify-center ${
+            activeTab === 'settings'
+              ? 'text-primary bg-primary/10 shadow-[0_0_20px_rgba(var(--primary),0.15)]'
+              : 'text-zinc-600 hover:text-zinc-200 hover:bg-white/5'
+          }`}
+          title="Settings"
+        >
+          <Settings size={20} className={activeTab === 'settings' ? "drop-shadow-[0_0_8px_rgba(var(--primary),0.5)]" : ""} />
+        </button>
+      </div>
     </aside>
   );
 };

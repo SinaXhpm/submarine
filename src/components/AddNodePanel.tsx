@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Cpu, X, Link2, ArrowLeftRight, Shield, Key, User, FolderPlus } from "lucide-react";
+import PasswordField from "./PasswordField";
 
-const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, sshKeys, folders, refreshData, isEditMode, formError, isMobile }: any) => {
+const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, sshKeys, folders, refreshFolders, isEditMode, formError, isMobile }: any) => {
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
 
@@ -12,7 +13,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
       await invoke("add_folder", { name: newFolderName, parentId: null });
       setNewFolderName("");
       setIsCreatingFolder(false);
-      refreshData();
+      refreshFolders();
     } catch (e) {
       console.error(e);
     }
@@ -34,7 +35,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
             <div className="w-8 h-8 bg-primary/10 rounded-lg flex items-center justify-center text-primary shadow-inner border border-primary/20">
               <Cpu size={16} />
             </div>
-            <h2 className="text-[12px] font-black text-white uppercase tracking-[0.2em]">Node Configuration</h2>
+            <h2 className="text-[14px] font-bold text-white tracking-tight">Server details</h2>
           </div>
           <button onClick={onClose} className="w-8 h-8 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-xl transition-all shadow-inner">
             <X size={16} />
@@ -47,17 +48,17 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
           <div className="grid grid-cols-1 gap-4">
             <div className="space-y-1.5">
-              <label className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider ml-1">Alias Name</label>
-              <input type="text" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" placeholder="Production Server" value={newNode.name} onChange={e => setNewNode({ ...newNode, name: e.target.value })} />
+              <label className="text-[11px] font-bold text-zinc-400 ml-1">Name</label>
+              <input type="text" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" placeholder="e.g. Work server" value={newNode.name} onChange={e => setNewNode({ ...newNode, name: e.target.value })} />
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider ml-1">Group / Folder</label>
+              <label className="text-[11px] font-bold text-zinc-400 ml-1">Folder</label>
               {!isCreatingFolder ? (
                 <div className="flex gap-2">
                   <select className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" value={newNode.folderId} onChange={e => setNewNode({ ...newNode, folderId: e.target.value })}>
                     <option value="" className="bg-[#1a1a1e] text-zinc-500">-- Root --</option>
-                    {folders?.map((f: any) => <option key={f.id} value={f.id} className="bg-[#1a1a1e] text-white">{f.name}</option>)}
+                    {folders?.map((f: any) => <option key={f.id} value={f.id.toString()} className="bg-[#1a1a1e] text-white">{f.name}</option>)}
                   </select>
                   <button onClick={() => setIsCreatingFolder(true)} className="w-9 h-9 bg-white/5 border border-white/10 rounded-lg text-primary hover:bg-white/10 transition-all flex items-center justify-center shrink-0">
                     <FolderPlus size={14} />
@@ -65,8 +66,8 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 </div>
               ) : (
                 <div className="flex gap-2 animate-in fade-in">
-                  <input type="text" className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder="New Folder..." value={newFolderName} onChange={e => setNewFolderName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleCreateFolder()} />
-                  <button onClick={handleCreateFolder} className="h-9 px-3 bg-primary text-black font-bold text-[12px] rounded-lg hover:bg-primary transition-all uppercase">Add</button>
+                  <input type="text" className="flex-1 h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder="Folder name…" value={newFolderName} onChange={e => setNewFolderName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleCreateFolder()} />
+                  <button onClick={handleCreateFolder} className="h-9 px-3 bg-primary text-black font-bold text-[12px] rounded-lg hover:bg-primary transition-all">Add</button>
                   <button onClick={() => setIsCreatingFolder(false)} className="w-9 h-9 bg-white/5 text-zinc-400 rounded-lg hover:bg-white/10 transition-all flex justify-center items-center shrink-0"><X size={14} /></button>
                 </div>
               )}
@@ -74,70 +75,92 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
             <div className="grid grid-cols-4 gap-4">
               <div className="col-span-3 space-y-1.5">
-                <label className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider ml-1">Host</label>
-                <input type="text" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" placeholder="192.168.1.1" value={newNode.host} onChange={e => setNewNode({ ...newNode, host: e.target.value })} />
+                <label className="text-[11px] font-bold text-zinc-400 ml-1">Host</label>
+                <input type="text" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" placeholder="192.168.1.1 or example.com" value={newNode.host} onChange={e => setNewNode({ ...newNode, host: e.target.value })} />
               </div>
               <div className="space-y-1.5">
-                <label className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider ml-1">Port</label>
+                <label className="text-[11px] font-bold text-zinc-400 ml-1">Port</label>
                 <input type="number" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-[#232328] transition-all shadow-inner" value={newNode.port} onChange={e => setNewNode({ ...newNode, port: parseInt(e.target.value) })} />
               </div>
             </div>
+
           </div>
 
           <div className="pt-5 border-t border-white/5 space-y-4">
             <div className="flex justify-between items-center">
-              <label className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider">Authentication Method</label>
+              <label className="text-[11px] font-bold text-zinc-400">How to log in</label>
               <select
-                className="bg-transparent text-[11px] font-black text-primary outline-none uppercase cursor-pointer tracking-wider"
+                className="bg-transparent text-[12px] font-bold text-primary outline-none cursor-pointer"
                 value={newNode.authType}
                 onChange={(e) => setNewNode({ ...newNode, authType: e.target.value })}
               >
-                <option value="vault" className="bg-[#121215] text-primary">Vault Identity</option>
-                <option value="custom_pass" className="bg-[#121215] text-primary">Manual Password</option>
-                <option value="custom_key" className="bg-[#121215] text-primary">Manual SSH Key</option>
+                <option value="vault" className="bg-[#121215] text-primary">Use a saved login</option>
+                <option value="custom_pass" className="bg-[#121215] text-primary">Type a password</option>
+                <option value="custom_key" className="bg-[#121215] text-primary">Use an SSH key</option>
               </select>
             </div>
 
-            {newNode.authType === 'vault' && (
-              <div className="space-y-4 animate-in fade-in slide-in-from-top-1">
-                <div className="space-y-1.5">
-                  <label className="text-[11px] font-bold text-zinc-500 uppercase tracking-wider ml-1">Identity</label>
-                  <select className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" value={newNode.credentialId} onChange={e => setNewNode({ ...newNode, credentialId: e.target.value })}>
-                    <option value="" className="bg-[#1a1a1e] text-zinc-500">-- Select Identity --</option>
-                    {credentials?.map((c: any) => <option key={c.id} value={c.id} className="bg-[#1a1a1e] text-zinc-300">{c.name} ({c.username})</option>)}
-                  </select>
+            {/*
+              Identity is now picked exclusively inside this auth section so
+              there's exactly one place a username can come from — either the
+              vault credential or the node's own inline fields. Removed the
+              redundant top-level User input that used to silently lose to
+              the vault row at connection time.
+            */}
+
+            {newNode.authType === 'vault' && (() => {
+              const selectedCred = credentials?.find((c: any) => c.id?.toString() === newNode.credentialId?.toString());
+              return (
+                <div className="space-y-3 animate-in fade-in slide-in-from-top-1">
+                  <div className="space-y-1.5">
+                    <label className="text-[11px] font-bold text-zinc-500 ml-1">Saved login</label>
+                    <select className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" value={newNode.credentialId} onChange={e => setNewNode({ ...newNode, credentialId: e.target.value })}>
+                      <option value="" className="bg-[#1a1a1e] text-zinc-500">-- Pick one --</option>
+                      {credentials?.map((c: any) => <option key={c.id} value={c.id.toString()} className="bg-[#1a1a1e] text-zinc-300">{c.name} ({c.username})</option>)}
+                    </select>
+                  </div>
+                  {selectedCred && (
+                    <div className="px-3 py-2 bg-primary/5 border border-primary/20 rounded-lg text-[11px] font-mono text-zinc-300 flex items-center gap-2">
+                      <User size={11} className="text-primary shrink-0" />
+                      <span className="text-zinc-500">Sign in as</span>
+                      <span className="text-primary font-bold">{selectedCred.username || "—"}</span>
+                      <span className="text-zinc-600 ml-auto text-[10px]">{selectedCred.auth_type === 'key' ? 'using key' : 'using password'}</span>
+                    </div>
+                  )}
                 </div>
-                <div className="space-y-1.5">
-                  <label className="text-[11px] font-bold text-zinc-500 uppercase tracking-wider ml-1">SSH_Key (Optional)</label>
-                  <select className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner">
-                    <option value="" className="bg-[#1a1a1e] text-zinc-500">-- None --</option>
-                    {sshKeys?.map((k: any) => <option key={k.id} value={k.id} className="bg-[#1a1a1e] text-zinc-300">{k.name}</option>)}
-                  </select>
-                </div>
-              </div>
-            )}
+              );
+            })()}
 
             {newNode.authType === 'custom_pass' && (
-              <div className="grid grid-cols-2 gap-4 animate-in fade-in">
+              <div className="space-y-3 animate-in fade-in">
                 <div className="space-y-1.5">
-                  <label className="text-[11px] font-bold text-zinc-500 uppercase tracking-wider ml-1">User</label>
-                  <input type="text" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder="root" value={newNode.username} onChange={e => setNewNode({ ...newNode, username: e.target.value })} />
+                  <label className="text-[11px] font-bold text-zinc-500 ml-1">Username</label>
+                  <input type="text" placeholder="root" value={newNode.username || ""} onChange={e => setNewNode({ ...newNode, username: e.target.value })} className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" />
                 </div>
                 <div className="space-y-1.5">
-                  <label className="text-[11px] font-bold text-zinc-500 uppercase tracking-wider ml-1">Pass</label>
-                  <input type="password" value={newNode.password || ""} onChange={e => setNewNode({ ...newNode, password: e.target.value })} className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder="••••••" />
+                  <label className="text-[11px] font-bold text-zinc-500 ml-1">Password</label>
+                  <PasswordField
+                    value={newNode.password || ""}
+                    onChange={(v) => setNewNode({ ...newNode, password: v })}
+                    className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner"
+                    placeholder="••••••"
+                  />
                 </div>
               </div>
             )}
 
             {newNode.authType === 'custom_key' && (
-              <div className="space-y-4 animate-in fade-in">
+              <div className="space-y-3 animate-in fade-in">
                 <div className="space-y-1.5">
-                  <label className="text-[11px] font-bold text-zinc-500 uppercase tracking-wider ml-1">User</label>
-                  <input type="text" className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" placeholder="root" />
+                  <label className="text-[11px] font-bold text-zinc-500 ml-1">Username</label>
+                  <input type="text" placeholder="root" value={newNode.username || ""} onChange={e => setNewNode({ ...newNode, username: e.target.value })} className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" />
                 </div>
-                <div className="p-3 border-2 border-dashed border-white/10 rounded-lg text-center hover:border-primary/40 hover:bg-primary/5 transition-colors cursor-pointer bg-[#1a1a1e]">
-                  <p className="text-[11px] font-bold text-zinc-500 uppercase tracking-wider">Upload key file</p>
+                <div className="space-y-1.5">
+                  <label className="text-[11px] font-bold text-zinc-500 ml-1">SSH key</label>
+                  <select className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" value={newNode.keyId} onChange={e => setNewNode({ ...newNode, keyId: e.target.value })}>
+                    <option value="" className="bg-[#1a1a1e] text-zinc-500">-- Pick a key --</option>
+                    {sshKeys?.map((k: any) => <option key={k.id} value={k.id.toString()} className="bg-[#1a1a1e] text-zinc-300">{k.name}</option>)}
+                  </select>
                 </div>
               </div>
             )}
@@ -145,9 +168,9 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
           <div className="pt-5 border-t border-white/5 space-y-4">
             <div className="flex justify-between items-center">
-              <label className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider">Traffic Relay</label>
-              <select className="bg-transparent text-[11px] font-black text-zinc-400 outline-none uppercase cursor-pointer tracking-wider" value={newNode.proxyType} onChange={e => setNewNode({ ...newNode, proxyType: e.target.value })}>
-                <option value="none" className="bg-[#121215] text-zinc-400">Direct</option>
+              <label className="text-[11px] font-bold text-zinc-400">Proxy</label>
+              <select className="bg-transparent text-[12px] font-bold text-zinc-300 outline-none cursor-pointer" value={newNode.proxyType} onChange={e => setNewNode({ ...newNode, proxyType: e.target.value })}>
+                <option value="none" className="bg-[#121215] text-zinc-400">No proxy</option>
                 <option value="socks5" className="bg-[#121215] text-zinc-400">SOCKS5</option>
                 <option value="http" className="bg-[#121215] text-zinc-400">HTTP</option>
               </select>
@@ -173,13 +196,17 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
             <div className="space-y-2.5">
               <div className="flex justify-between items-center">
-                <span className="text-[11px] font-bold text-zinc-400 uppercase tracking-wider">Tunnels</span>
-                <button onClick={() => setNewNode({ ...newNode, tunnels: [...newNode.tunnels, { local: "1080", remote: "", type: "D" }] })} className="text-[10px] font-black text-primary hover:text-primary uppercase transition-colors tracking-wider">+ New Rule</button>
+                <span className="text-[11px] font-bold text-zinc-400">Port forwarding</span>
+                <button onClick={() => setNewNode({ ...newNode, tunnels: [...newNode.tunnels, { rid: `t-${Date.now()}-${Math.random().toString(36).slice(2,7)}`, local: "1080", remote: "", type: "D" }] })} className="text-[11px] font-bold text-primary hover:text-primary transition-colors">+ Add</button>
               </div>
 
               <div className="space-y-2">
                 {newNode.tunnels?.map((t: any, idx: number) => (
-                  <div key={idx} className="flex items-center gap-2 p-2 bg-[#1a1a1e] rounded-lg border border-white/5 group transition-all hover:border-primary/30">
+                  // `rid` is a stable per-row id added on Add. Falling
+                  // back to idx for legacy rows that lack it; new rows
+                  // always carry rid so deletions / reorders preserve
+                  // each input's focus and cursor state.
+                  <div key={t.rid ?? idx} className="flex items-center gap-2 p-2 bg-[#1a1a1e] rounded-lg border border-white/5 group transition-all hover:border-primary/30">
                     <select
                       className="bg-transparent text-[11px] font-black outline-none text-primary uppercase tracking-wider cursor-pointer pl-1"
                       value={t.type}
@@ -194,7 +221,11 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
                     <input
                       className="flex-1 min-w-0 bg-transparent text-[12px] font-mono outline-none text-zinc-300 placeholder:text-zinc-700"
-                      placeholder={t.type === 'D' ? "Port (1080)" : "Local (8080)"}
+                      placeholder={
+                        t.type === 'D' ? "Port (1080)" :
+                        t.type === 'R' ? "Server bind (8080 or 0.0.0.0:8080)" :
+                                         "Local (8080 or 0.0.0.0:8080)"
+                      }
                       value={t.local}
                       onChange={e => updateTunnel(idx, 'local', e.target.value)}
                     />
@@ -223,8 +254,8 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
 
         {/* Footer */}
         <div className="p-6 border-t border-white/5 shrink-0">
-          <button onClick={onSave} className="w-full h-10 bg-primary text-black font-black rounded-lg uppercase text-[12px] tracking-wider hover:bg-primary hover:shadow-[0_0_20px_rgba(var(--primary),0.3)] transition-all active:scale-[0.98] flex items-center justify-center gap-2">
-            <Cpu size={14} /> {isEditMode ? "Edit Node" : "Deploy Node"}
+          <button onClick={onSave} className="w-full h-10 bg-primary text-black font-bold rounded-lg text-[13px] tracking-tight hover:bg-primary hover:shadow-[0_0_20px_rgba(var(--primary),0.3)] transition-all active:scale-[0.98] flex items-center justify-center gap-2">
+            <Cpu size={14} /> {isEditMode ? "Save changes" : "Save server"}
           </button>
         </div>
       </div>

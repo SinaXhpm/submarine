@@ -6,8 +6,8 @@
   :root {
     --background: #0a0a0c;
     --foreground: 0 0% 100%;
-    --primary: 16 185 129;
-    --primary-hex: #10b981;
+    --primary: 96 165 250;
+    --primary-hex: #60a5fa;
     --base-font-size: 15.5px;
     --border: 240 5.9% 15%;
   }
@@ -71,6 +71,10 @@
   animation: animate-in 0.3s ease-out forwards;
 }
 
+/* `to` intentionally omits `transform` so the element settles back to
+   `transform: none` after the animation. A lingering transform (even
+   translateY(0)) creates a containing block that breaks `position: fixed`
+   descendants — e.g. the SFTP right-click context menu would render off-screen. */
 @keyframes animate-in {
   from {
     opacity: 0;
@@ -78,7 +82,6 @@
   }
   to {
     opacity: 1;
-    transform: translateY(0);
   }
 }
 
@@ -98,13 +101,13 @@
 }
 
 ::-webkit-scrollbar-thumb {
-  background-color: rgba(16, 185, 129, 0.15) !important; /* Elegant Emerald Green */
+  background-color: rgba(96, 165, 250, 0.18) !important;
   border-radius: 9999px !important;
-  border: 1px solid rgba(16, 185, 129, 0.05) !important;
+  border: 1px solid rgba(96, 165, 250, 0.06) !important;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(16, 185, 129, 0.4) !important;
+  background-color: rgba(96, 165, 250, 0.45) !important;
 }
 
 /* 2. Specific Overrides for Xterm Viewport & Terminal Children */
@@ -129,9 +132,9 @@
 .xterm .xterm-viewport::-webkit-scrollbar-thumb,
 .xterm-viewport *::-webkit-scrollbar-thumb,
 .xterm *::-webkit-scrollbar-thumb {
-  background-color: rgba(16, 185, 129, 0.15) !important;
+  background-color: rgba(96, 165, 250, 0.18) !important;
   border-radius: 9999px !important;
-  border: 1px solid rgba(16, 185, 129, 0.05) !important;
+  border: 1px solid rgba(96, 165, 250, 0.06) !important;
   transition: background-color 0.2s ease-in-out !important;
 }
 
@@ -139,12 +142,12 @@
 .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover,
 .xterm-viewport *::-webkit-scrollbar-thumb:hover,
 .xterm *::-webkit-scrollbar-thumb:hover {
-  background-color: rgba(16, 185, 129, 0.4) !important;
-  border: 1px solid rgba(16, 185, 129, 0.1) !important;
+  background-color: rgba(96, 165, 250, 0.45) !important;
+  border: 1px solid rgba(96, 165, 250, 0.12) !important;
 }
 
 /* 3. Standards-based Thin Scrollbars for cross-browser engines */
 * {
   scrollbar-width: thin !important;
-  scrollbar-color: rgba(16, 185, 129, 0.15) transparent !important;
+  scrollbar-color: rgba(96, 165, 250, 0.18) transparent !important;
 }

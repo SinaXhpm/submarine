@@ -1,7 +1,7 @@
-import { Search, Plus, Server, Globe, Folder, ChevronLeft, Trash2, Edit2 } from "lucide-react";
+import { Search, Plus, Server, Globe, Folder, ChevronLeft, Trash2, Edit2, Zap } from "lucide-react";
 import { useState } from "react";
 
-export const NodeGrid = ({ servers, folders, onOpenServer, onEditServer, onAddClick, onRemoveServer, onRemoveFolder, isMobile }: any) => {
+export const NodeGrid = ({ servers, folders, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, isMobile }: any) => {
   const [search, setSearch] = useState("");
   const [activeFolderId, setActiveFolderId] = useState<number | null>(null);
 
@@ -45,7 +45,7 @@ export const NodeGrid = ({ servers, folders, onOpenServer, onEditServer, onAddCl
           <Edit2 size={14} />
         </button>
         <button 
-          onClick={(e) => { e.stopPropagation(); if(window.confirm('Delete node?')) onRemoveServer(s.id); }}
+          onClick={(e) => { e.stopPropagation(); if(window.confirm('Delete this server?')) onRemoveServer(s.id); }}
           className="p-2 text-zinc-500 hover:text-red-500 transition-all"
         >
           <Trash2 size={14} />
@@ -69,7 +69,7 @@ export const NodeGrid = ({ servers, folders, onOpenServer, onEditServer, onAddCl
         <div className="flex items-center gap-2 relative">
           <span className="text-[10px] bg-black text-zinc-500 px-1.5 py-0.5 rounded-md font-mono shrink-0 group-hover:opacity-0 transition-opacity">{serverCount}</span>
           <button 
-            onClick={(e) => { e.stopPropagation(); if(window.confirm('Delete folder and all servers inside?')) onRemoveFolder(f.id); }}
+            onClick={(e) => { e.stopPropagation(); if(window.confirm('Delete this folder and everything inside?')) onRemoveFolder(f.id); }}
             className="absolute right-0 opacity-0 group-hover:opacity-100 p-1.5 text-zinc-500 hover:text-red-500 transition-all"
           >
             <Trash2 size={14} />
@@ -85,7 +85,7 @@ export const NodeGrid = ({ servers, folders, onOpenServer, onEditServer, onAddCl
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" size={14} />
         <input 
           type="text"
-          placeholder="Search nodes..."
+          placeholder="Search servers…"
           className="w-full h-9 bg-[#1c1c21] border border-white/10 rounded-lg pl-9 pr-4 text-[13px] text-zinc-100 outline-none focus:border-primary/50 focus:bg-[#16161a] transition-all placeholder:text-zinc-600 shadow-inner"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
@@ -103,7 +103,7 @@ export const NodeGrid = ({ servers, folders, onOpenServer, onEditServer, onAddCl
             >
               <ChevronLeft size={16} />
             </button>
-            <h2 className="text-[14px] font-black text-primary uppercase tracking-[0.2em] flex items-center gap-2">
+            <h2 className="text-[15px] font-bold text-primary tracking-tight flex items-center gap-2">
               <Folder size={16} /> {currentFolder?.name}
             </h2>
           </div>
@@ -119,25 +119,38 @@ export const NodeGrid = ({ servers, folders, onOpenServer, onEditServer, onAddCl
                 <Plus size={28} />
               </div>
               <div className="text-center">
-                <h3 className="text-[15px] font-bold text-white uppercase tracking-wider">Initialize Node</h3>
-                <p className="text-[12px] text-zinc-500 mt-1 font-medium uppercase tracking-tight">Deploy your first connection</p>
+                <h3 className="text-[15px] font-bold text-white tracking-tight">Add your first server</h3>
+                <p className="text-[12px] text-zinc-500 mt-1">Tap here to get started.</p>
               </div>
             </button>
           </div>
         ) : (
           <div className={`grid ${isMobile ? 'grid-cols-1' : 'grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5'} gap-3`}>
             
-            {/* Show Add Node only in Root or when searching */}
+            {/* Show Add Node + Quick Connect only in Root or when searching */}
             {(!isSearching && activeFolderId === null) && (
-              <button 
-                onClick={onAddClick}
-                className="flex items-center gap-3 p-3 h-14 bg-[#16161a] border border-dashed border-white/10 rounded-xl hover:bg-primary/5 hover:border-primary/40 transition-all group shadow-inner"
-              >
-                <div className="w-8 h-8 bg-primary/5 rounded-lg flex items-center justify-center text-zinc-500 group-hover:text-primary transition-colors shrink-0">
-                  <Plus size={16} />
-                </div>
-                <span className="text-[10px] font-bold text-zinc-500 group-hover:text-primary uppercase tracking-widest transition-colors">Add Node</span>
-              </button>
+              <>
+                <button
+                  onClick={onAddClick}
+                  className="flex items-center gap-3 p-3 h-14 bg-[#16161a] border border-dashed border-white/10 rounded-xl hover:bg-primary/5 hover:border-primary/40 transition-all group shadow-inner"
+                >
+                  <div className="w-8 h-8 bg-primary/5 rounded-lg flex items-center justify-center text-zinc-500 group-hover:text-primary transition-colors shrink-0">
+                    <Plus size={16} />
+                  </div>
+                  <span className="text-[12px] font-bold text-zinc-400 group-hover:text-primary tracking-tight transition-colors">Add server</span>
+                </button>
+                {onQuickConnect && (
+                  <button
+                    onClick={onQuickConnect}
+                    className="flex items-center gap-3 p-3 h-14 bg-[#16161a] border border-dashed border-amber-500/25 rounded-xl hover:bg-amber-500/5 hover:border-amber-500/50 transition-all group shadow-inner"
+                  >
+                    <div className="w-8 h-8 bg-amber-500/10 rounded-lg flex items-center justify-center text-amber-300/80 group-hover:text-amber-200 transition-colors shrink-0">
+                      <Zap size={15} />
+                    </div>
+                    <span className="text-[12px] font-bold text-amber-300/90 group-hover:text-amber-100 tracking-tight transition-colors">Quick connect</span>
+                  </button>
+                )}
+              </>
             )}
 
             {/* Render Folders (only in root, and when not searching) */}
@@ -151,14 +164,14 @@ export const NodeGrid = ({ servers, folders, onOpenServer, onEditServer, onAddCl
             {/* Empty Folder State */}
             {!isSearching && activeFolderId !== null && displayedServers.length === 0 && (
               <div className="col-span-full py-10 text-center text-zinc-600 text-xs italic">
-                No servers in this group
+                Nothing in this folder yet.
               </div>
             )}
             
             {/* Empty Search State */}
             {isSearching && displayedServers.length === 0 && (
               <div className="col-span-full py-10 text-center text-zinc-600 text-xs italic">
-                No servers match your search
+                No matches.
               </div>
             )}
 

@@ -2,12 +2,12 @@ import { Settings, Palette, RefreshCw, Pipette } from "lucide-react";
 
 const SettingsPanel = ({ settings, setSettings }: any) => {
   const accentColors = [
+    { name: 'Light Blue', value: '#60a5fa' },
+    { name: 'Sky', value: '#38bdf8' },
+    { name: 'Cyan', value: '#22d3ee' },
+    { name: 'Indigo', value: '#818cf8' },
     { name: 'Emerald', value: '#10b981' },
-    { name: 'Blue', value: '#3b82f6' },
-    { name: 'Purple', value: '#a855f7' },
     { name: 'Rose', value: '#f43f5e' },
-    { name: 'Amber', value: '#f59e0b' },
-    { name: 'Sky', value: '#0ea5e9' },
   ];
 
   const bgColors = [
@@ -22,10 +22,10 @@ const SettingsPanel = ({ settings, setSettings }: any) => {
   return (
     <div className="flex-1 p-10 overflow-y-auto custom-scrollbar animate-in">
       <header className="mb-10">
-        <h2 className="text-2xl font-black text-white uppercase tracking-[0.2em] flex items-center gap-3">
+        <h2 className="text-2xl font-bold text-white tracking-tight flex items-center gap-3">
           <Settings size={24} className="text-primary" /> Settings
         </h2>
-        <p className="text-[10px] text-zinc-500 mt-2 font-black uppercase tracking-[0.3em]">System Configuration & Aesthetics</p>
+        <p className="text-[13px] text-zinc-400 mt-2">Tweak how Submarine looks and feels.</p>
       </header>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
@@ -144,7 +144,7 @@ const SettingsPanel = ({ settings, setSettings }: any) => {
             <button 
               onClick={() => {
                 if(window.confirm('Reset all UI customizations?')) {
-                  setSettings({ primaryColor: '#10b981', backgroundColor: '#0a0a0c', terminalFontSize: 14 });
+                  setSettings({ primaryColor: '#60a5fa', backgroundColor: '#0a0a0c', terminalFontSize: 14 });
                 }
               }}
               className="px-4 h-9 bg-zinc-900 border border-white/5 text-zinc-300 rounded-xl text-xs font-bold uppercase hover:bg-white/5 transition-all w-full"
