@@ -1,7 +1,7 @@
 [package]
-name = "omni"
+name = "submarine"
 version = "0.1.0"
-description = "Omni SSH Client"
+description = "Submarine SSH Client"
 authors = ["Sina"]
 edition = "2021"
 rust-version = "1.70"
@@ -11,22 +11,39 @@ tauri-build = { version = "2.0", features = [] }
 
 [dependencies]
 tauri = { version = "2.1", features = [] }
-tauri-plugin-shell = "2.1"
-tauri-plugin-fs = "2.1"
-tauri-plugin-opener = "2.1"
 hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
-rusqlite = { version = "0.31", features = ["bundled", "backup"] }
+rusqlite = { version = "0.31", features = ["bundled", "backup", "serialize"] }
 argon2 = "0.5"
 aes-gcm = "0.10"
 rand = "0.8"
 rand_core = { version = "0.6", features = ["getrandom"] }
 directories = "5.0"
-russh = "0.40"
-russh-keys = "0.40"
+russh = "0.40.2"
+russh-keys = "0.40.1"
 ssh-key = { version = "0.6", features = ["alloc", "encryption", "getrandom", "ed25519", "rsa"] }
 tokio-socks = "0.5"
 async-http-proxy = { version = "1.2", features = ["runtime-tokio"] }
 async-trait = "0.1.89"
+russh-sftp = "2.1.2"
+rfd = "0.14"
+open = "5.1"
+notify = "6.1.1"
+regex = "1.10"
+# rustls-tls so we don't drag in OpenSSL on Windows builds. multipart for blob
+# uploads; json for typed request/response bodies.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "stream"] }
+# Vault v2 compresses the SQLite serialisation with zstd before encrypting.
+# Real profiles compress ~50-70% (lots of repeated SQL+JSON structure), so
+# both local disk and cloud blobs shrink correspondingly. v1 vaults stay
+# readable — we only emit v2 going forward.
+zstd = { version = "0.13", default-features = false }
+# Zeroize-on-drop wrappers for the master vault key and the decompressed
+# SQLite plaintext. Without this, secrets stay in the heap until allocator
+# reuse — long enough for a swap file / crash dump to capture them. We
+# wrap only the things that survive past one function call; transient
+# String/Vec passed as args to argon2/aes-gcm are zeroized internally by
+# those crates.
+zeroize = { version = "1.8", features = ["zeroize_derive"] }

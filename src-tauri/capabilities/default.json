@@ -1,25 +1,17 @@
 {
   "$schema": "../gen/schemas/desktop-capability.json",
   "identifier": "default",
-  "description": "Default capability for the desktop app",
+  "description": "Minimum permission set the desktop app actually needs. We intentionally omit shell:*, opener:*, fs:*, and webview:* — the app never calls those plugin APIs, and exposing them to the webview just widens the blast radius of any future XSS.",
   "windows": ["*"],
   "permissions": [
     "core:default",
-    "shell:default",
-    "opener:default",
-    "fs:default",
-    "core:path:default",
     "core:event:default",
     "core:app:default",
-    "core:resources:default",
-    "core:menu:default",
-    "core:tray:default",
+    "core:path:default",
     "core:window:default",
     "core:window:allow-minimize",
     "core:window:allow-close",
     "core:window:allow-maximize",
-    "core:window:allow-set-title",
-    "core:image:default",
-    "core:webview:default"
+    "core:window:allow-set-title"
   ]
 }

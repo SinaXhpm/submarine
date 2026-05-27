@@ -6,15 +6,40 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use async_trait::async_trait;
 
+/// Per-terminal command. We deliberately split data from resize at the
+/// channel level: keystrokes flow through `Data` on an mpsc, while resizes
+/// land in a tokio::sync::watch (last-wins, coalesces a 60Hz drag burst
+/// into one effective resize). Keeping them on the same FIFO mpsc meant
+/// typed bytes could queue behind dozens of resize events during a
+/// window drag — visible as keystrokes arriving seconds late.
 pub enum TerminalCommand {
     Data(Vec<u8>),
-    Resize { cols: u32, rows: u32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PtySize {
+    pub cols: u32,
+    pub rows: u32,
 }
 
 pub struct SshState {
     pub fp_txs: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     pub connections: Arc<Mutex<HashMap<String, Arc<Mutex<client::Handle<ClientHandler>>>>>>,
     pub terminal_txs: Arc<Mutex<HashMap<String, mpsc::Sender<TerminalCommand>>>>,
+    /// Per-terminal "last requested PTY size" watch. The PTY task selects
+    /// on this in parallel with `terminal_txs` and forwards `window_change`
+    /// to the server. Using a watch (last-wins) means a 60Hz resize burst
+    /// during a window drag collapses to a single SSH message instead of
+    /// dozens, AND the keystroke FIFO can't be blocked behind resizes.
+    pub resize_txs: Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<PtySize>>>>,
+    pub sftp_sessions: Arc<Mutex<HashMap<String, Arc<russh_sftp::client::SftpSession>>>>,
+    /// Active SSH port-forwards keyed by tunnel id. See `crate::tunnel`.
+    pub tunnels: Arc<Mutex<HashMap<String, crate::tunnel::ActiveTunnel>>>,
+    /// For each connected session, the map of server ports we've asked the
+    /// server to forward back to us. Populated by `tunnel::start_tunnel` for
+    /// "R" tunnels and consulted by `ClientHandler` when a forwarded channel
+    /// arrives.
+    pub forwarded_targets: Arc<Mutex<HashMap<String, crate::tunnel::ForwardedTargets>>>,
 }
 
 impl SshState {
@@ -23,6 +48,10 @@ impl SshState {
             fp_txs: Arc::new(Mutex::new(HashMap::new())),
             connections: Arc::new(Mutex::new(HashMap::new())),
             terminal_txs: Arc::new(Mutex::new(HashMap::new())),
+            resize_txs: Arc::new(Mutex::new(HashMap::new())),
+            sftp_sessions: Arc::new(Mutex::new(HashMap::new())),
+            tunnels: Arc::new(Mutex::new(HashMap::new())),
+            forwarded_targets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -30,10 +59,21 @@ impl SshState {
 pub struct ClientHandler {
     pub app: AppHandle,
     pub session_id: String,
+    /// Per-connect-attempt random nonce. Used as the key for the
+    /// fingerprint-approval oneshot channel so a stale "accept" from a
+    /// prior attempt (or a malicious frontend message that knows only
+    /// `session_id`) cannot satisfy the prompt for a fresh connection.
+    /// Echoed in the `fingerprint-prompt-{session_id}` event payload and
+    /// must be sent back by the frontend in `verify_fingerprint_response`.
+    pub connect_nonce: String,
     pub server_host: String,
     pub server_port: u16,
     pub db: Arc<std::sync::Mutex<Option<rusqlite::Connection>>>,
     pub fp_rx: Option<oneshot::Receiver<bool>>,
+    /// Per-session map populated by R tunnels — when the server pushes a
+    /// `forwarded-tcpip` channel back, we look the port up here to find the
+    /// local target to bridge it to.
+    pub forwarded_targets: crate::tunnel::ForwardedTargets,
 }
 
 #[async_trait]
@@ -50,23 +90,53 @@ impl client::Handler for ClientHandler {
             "type": "info"
         }));
 
-        // 1. Check if the key is already in known_hosts database
+        // Look at every prior fingerprint we've recorded for this host:port.
+        // Three possible outcomes:
+        //   - one of them matches the offered key → trusted, proceed
+        //   - none match BUT some rows exist → KEY CHANGED. Looks just like
+        //     an SSH MITM. The user must be warned with very different copy
+        //     than "first time seeing this host".
+        //   - no rows at all → unknown host, ordinary first-time prompt.
         let mut is_known = false;
-        if let Some(ref conn) = *self.db.lock().unwrap() {
-            let stmt = conn.prepare("SELECT fingerprint FROM known_hosts WHERE host=?1 AND port=?2").ok();
-            if let Some(mut stmt) = stmt {
-                let rows = stmt.query(rusqlite::params![self.server_host, self.server_port]).ok();
-                if let Some(mut rows) = rows {
-                    while let Some(row) = rows.next().ok().flatten() {
-                        if let Some(saved_fp) = row.get::<_, String>(0).ok() {
-                            if saved_fp == fp_str {
-                                is_known = true;
-                                break;
+        let mut had_any_prior = false;
+        let mut prior_fingerprints: Vec<String> = Vec::new();
+        // Read the existing known_hosts rows in a SCOPED block. The std
+        // mutex guard must NOT live across any subsequent `.await` —
+        // its !Send nature would otherwise break the future's Send
+        // bound. A poisoned mutex used to be silently treated as
+        // "unknown host" (re-prompts the user, hides MITM); now we
+        // fail closed by setting an `aborted` flag and returning after
+        // the scope ends.
+        let mut aborted = false;
+        {
+            match self.db.lock() {
+                Ok(guard) => {
+                    if let Some(ref conn) = *guard {
+                        if let Ok(mut stmt) = conn.prepare("SELECT fingerprint FROM known_hosts WHERE host=?1 AND port=?2") {
+                            if let Ok(mut rows) = stmt.query(rusqlite::params![self.server_host, self.server_port]) {
+                                while let Some(row) = rows.next().ok().flatten() {
+                                    if let Some(saved_fp) = row.get::<_, String>(0).ok() {
+                                        had_any_prior = true;
+                                        if saved_fp == fp_str {
+                                            is_known = true;
+                                        } else {
+                                            prior_fingerprints.push(saved_fp);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
+                Err(_) => { aborted = true; }
             }
+        }
+        if aborted {
+            let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
+                "msg": "Host-key DB lock is poisoned — refusing connection. Restart the app.",
+                "type": "error"
+            }));
+            return Ok((self, false));
         }
 
         if is_known {
@@ -77,30 +147,73 @@ impl client::Handler for ClientHandler {
             return Ok((self, true));
         }
 
-        // 2. Not known, prompt user
-        let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
-            "msg": "Host fingerprint is unknown. Waiting for user approval...",
-            "type": "warn"
-        }));
+        let mismatch = had_any_prior;
+
+        if mismatch {
+            // Loud, distinct log line for the activity panel — this is the
+            // SSH "REMOTE HOST IDENTIFICATION HAS CHANGED" moment.
+            let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
+                "msg": "⚠ WARNING: Remote host key has CHANGED since you last connected. This could indicate a man-in-the-middle attack, or the server's host key was rotated. Verify out-of-band before accepting.",
+                "type": "error"
+            }));
+        } else {
+            let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
+                "msg": "Host fingerprint is unknown. Waiting for user approval...",
+                "type": "warn"
+            }));
+        }
 
         let _ = self.app.emit(&format!("fingerprint-prompt-{}", self.session_id), serde_json::json!({
             "host": self.server_host,
             "keyType": key_type,
-            "fingerprint": fp_str
+            "fingerprint": fp_str,
+            "mismatch": mismatch,
+            "priorFingerprints": prior_fingerprints,
+            // Frontend MUST echo this back via verify_fingerprint_response.
+            // Without it the response is rejected. Defeats stale-channel /
+            // session-id-guessing attacks against the TOFU prompt.
+            "nonce": self.connect_nonce,
         }));
 
         if let Some(rx) = self.fp_rx.take() {
             match tokio::time::timeout(tokio::time::Duration::from_secs(10), rx).await {
                 Ok(Ok(true)) => {
-                    // Save to database
-                    if let Some(ref conn) = *self.db.lock().unwrap() {
-                        let _ = conn.execute(
-                            "INSERT INTO known_hosts (host, port, fingerprint) VALUES (?1, ?2, ?3)",
-                            rusqlite::params![self.server_host, self.server_port, fp_str]
-                        );
+                    // Save to database. If this was a mismatch we must wipe
+                    // the stale rows first — otherwise the next connection
+                    // would see "any row matches the OLD fingerprint = trusted"
+                    // because of the loop above, defeating the warning.
+                    //
+                    // Manual BEGIN/COMMIT (instead of rusqlite's transaction())
+                    // because we only hold `&Connection` through the mutex
+                    // guard, not `&mut Connection`. On any failure between
+                    // DELETE and INSERT we roll back so we never leave the
+                    // host with zero recorded fingerprints (which would silently
+                    // downgrade the next connection from "mismatch" to "first
+                    // time").
+                    if let Ok(guard) = self.db.lock() {
+                        if let Some(ref conn) = *guard {
+                            let result: rusqlite::Result<()> = (|| {
+                                conn.execute("BEGIN", [])?;
+                                if mismatch {
+                                    conn.execute(
+                                        "DELETE FROM known_hosts WHERE host=?1 AND port=?2",
+                                        rusqlite::params![self.server_host, self.server_port],
+                                    )?;
+                                }
+                                conn.execute(
+                                    "INSERT INTO known_hosts (host, port, fingerprint) VALUES (?1, ?2, ?3)",
+                                    rusqlite::params![self.server_host, self.server_port, fp_str],
+                                )?;
+                                conn.execute("COMMIT", [])?;
+                                Ok(())
+                            })();
+                            if result.is_err() {
+                                let _ = conn.execute("ROLLBACK", []);
+                            }
+                        }
                     }
                     let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
-                        "msg": "Host key accepted and saved.",
+                        "msg": if mismatch { "New host key accepted. Old entries replaced." } else { "Host key accepted and saved." },
                         "type": "success"
                     }));
                     Ok((self, true))
@@ -133,6 +246,38 @@ impl client::Handler for ClientHandler {
         } else {
             Ok((self, false))
         }
+    }
+
+    /// Inbound channel from a server-side `tcpip_forward` we set up earlier
+    /// (remote tunnel, the SSH `-R` shape). The server has accepted an
+    /// outside connection on `connected_port`; we just need to bridge that
+    /// channel to a local TCP socket pointed at the user's chosen target.
+    async fn server_channel_open_forwarded_tcpip(
+        self,
+        channel: russh::Channel<client::Msg>,
+        _connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        session: client::Session,
+    ) -> Result<(Self, client::Session), Self::Error> {
+        let entry = self.forwarded_targets.lock().await.get(&connected_port).cloned();
+        match entry {
+            Some(entry) => {
+                // Spawn the bridge so we don't hold up russh's protocol task.
+                // `bridge_forwarded_channel` does the local connect and
+                // tokio::io::copy_bidirectional dance, plus bumps the
+                // tunnel's connection counter for the UI.
+                tokio::spawn(async move {
+                    crate::tunnel::bridge_forwarded_channel(entry, channel.into_stream()).await;
+                });
+            }
+            None => {
+                // No tunnel registered for this port — let the channel drop,
+                // which closes it on the server's side.
+            }
+        }
+        Ok((self, session))
     }
 }
 
