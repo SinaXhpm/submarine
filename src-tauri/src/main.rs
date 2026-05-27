@@ -543,10 +543,21 @@ async fn setup_master_db(app_handle: tauri::AppHandle, mut password: String, sta
         let encrypted_data = fs::read(&path)
             .map_err(|e| format!("[FILE] VAULT_READ_FAILED: {}", e))?;
         let (parsed_salt, nonce, ciphertext) = parse_vault_blob(&encrypted_data)?;
-        key = Zeroizing::new(derive_key(&password, &parsed_salt)?);
-        // Wipe the source password as soon as the key is derived — keeps
-        // the secret out of the heap allocator for the rest of the request.
-        password.zeroize();
+        // Argon2id with m=64MiB is CPU-heavy (≈0.5–2s depending on hardware).
+        // Running it directly on the async runtime thread blocks every other
+        // Tauri command for that duration — UI freezes, IPC backs up. Hand
+        // it off to the blocking pool so the runtime stays responsive. The
+        // closure also zeroizes the password buffer once the derivation is
+        // done, preserving the secret-hygiene the original sync path had.
+        let mut password_owned = std::mem::take(&mut password);
+        let derived = tokio::task::spawn_blocking(move || {
+            let res = derive_key(&password_owned, &parsed_salt);
+            password_owned.zeroize();
+            res
+        })
+            .await
+            .map_err(|e| format!("[CRYPTO] KDF_JOIN: {}", e))??;
+        key = Zeroizing::new(derived);
         let raw = Zeroizing::new(decrypt_with_key(&ciphertext, &nonce, &key)?);
         let decrypted_data = Zeroizing::new(vault_decompress(&raw)?);
 
@@ -564,8 +575,17 @@ async fn setup_master_db(app_handle: tauri::AppHandle, mut password: String, sta
         let mut fresh = [0u8; SALT_LEN];
         rand::thread_rng().fill(&mut fresh);
         salt_bytes = fresh;
-        key = Zeroizing::new(derive_key(&password, &salt_bytes)?);
-        password.zeroize();
+        // Same reasoning as the unlock path above — keep the async runtime
+        // unblocked during the Argon2 derivation on fresh-profile creation.
+        let mut password_owned = std::mem::take(&mut password);
+        let derived = tokio::task::spawn_blocking(move || {
+            let res = derive_key(&password_owned, &salt_bytes);
+            password_owned.zeroize();
+            res
+        })
+            .await
+            .map_err(|e| format!("[CRYPTO] KDF_JOIN: {}", e))??;
+        key = Zeroizing::new(derived);
         needs_resave = true;
 
         conn = Connection::open_in_memory()
@@ -1531,6 +1551,49 @@ async fn initiate_connection(
         // protocol max for maximum_packet_size (russh enforces this).
         config.window_size = 8 * 1024 * 1024;
         config.maximum_packet_size = 65535;
+        // Widen the negotiation set to match what OpenSSH ships. The default
+        // russh `Preferred` only lists curve25519 + DH-G14-SHA256 for KEX and
+        // Ed25519 + ECDSA-P256 for host keys — fine for modern boxes but
+        // trips "No common key/kex algorithm" against older servers, embedded
+        // SSH stacks, and many shared hosts whose host key is still RSA. We
+        // add the legacy DH groups and the full RSA host-key family so the
+        // client can talk to essentially any SSH server still in production.
+        // Order is strongest-first; russh negotiates by picking the first
+        // entry from our list that the server also offers.
+        config.preferred = russh::Preferred {
+            kex: &[
+                russh::kex::CURVE25519,
+                russh::kex::CURVE25519_PRE_RFC_8731,
+                russh::kex::DH_G14_SHA256,
+                russh::kex::DH_G14_SHA1,
+                russh::kex::DH_G1_SHA1,
+                russh::kex::EXTENSION_SUPPORT_AS_CLIENT,
+                russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT,
+            ],
+            key: &[
+                russh_keys::key::ED25519,
+                russh_keys::key::ECDSA_SHA2_NISTP256,
+                russh_keys::key::RSA_SHA2_512,
+                russh_keys::key::RSA_SHA2_256,
+                russh_keys::key::SSH_RSA,
+            ],
+            cipher: &[
+                russh::cipher::CHACHA20_POLY1305,
+                russh::cipher::AES_256_GCM,
+                russh::cipher::AES_256_CTR,
+                russh::cipher::AES_192_CTR,
+                russh::cipher::AES_128_CTR,
+            ],
+            mac: &[
+                russh::mac::HMAC_SHA512_ETM,
+                russh::mac::HMAC_SHA256_ETM,
+                russh::mac::HMAC_SHA512,
+                russh::mac::HMAC_SHA256,
+                russh::mac::HMAC_SHA1_ETM,
+                russh::mac::HMAC_SHA1,
+            ],
+            compression: &["none", "zlib", "zlib@openssh.com"],
+        };
         let config = Arc::new(config);
         
         let connect_future = client::connect_stream(config, StreamWrapper(stream), handler);
@@ -1550,16 +1613,6 @@ async fn initiate_connection(
                             session.authenticate_publickey(&effective_user, key_arc).await
                         }
                         Err(e) => {
-                            let err_str = e.to_string();
-                            if err_str.contains("Unsupported key type rsa") || err_str.contains("rsa") || private_key.contains("RSA PRIVATE KEY") {
-                                emit_log("----------------------------------------------------------------", "error");
-                                emit_log("❌ [ERROR] Unsupported Key Type: RSA private keys are not supported on this platform.", "error");
-                                emit_log("💡 [REASON] Submarine uses pure-Rust cryptography and doesn't bundle OpenSSL for RSA.", "error");
-                                emit_log("🔑 [SOLUTION] Please generate a modern Ed25519 key (fully supported):", "info");
-                                emit_log("    ssh-keygen -t ed25519 -f id_ed25519", "info");
-                                emit_log("    Then paste the contents of 'id_ed25519' into Submarine.", "info");
-                                emit_log("----------------------------------------------------------------", "error");
-                            }
                             emit_log(&format!("Failed to parse private key: {}", e), "error");
                             Err(russh::Error::from(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,

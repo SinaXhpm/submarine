@@ -24,6 +24,7 @@ Submarine is a fast, local-first SSH/SFTP client with optional end-to-end encryp
 - **Quick commands** — per-host snippets you can fire into any open shell
 - **Saved profiles** — passwords and private keys stored in a local AES-256-GCM vault
 - **Cloud sync (optional)** — encrypted blob sync across machines; server never sees your data
+- **Broad SSH compatibility** — Ed25519, ECDSA P-256, RSA (SHA-2/SHA-1) host keys + matching client keys; legacy KEX (DH-G14/G1) and MAC (HMAC-SHA1) for older servers
 - **TOFU host keys** — first-use prompt with fingerprint, pinned thereafter
 - **Quick connect** — one-off connections without saving
 
@@ -51,7 +52,7 @@ Grab a binary from the [latest release](https://github.com/sinaxhpm/submarine/re
 
 ## Build from source
 
-Requirements: Node 20+, Rust stable, plus [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS.
+Requirements: Node 20+, Rust stable, plus [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS. Windows additionally needs **Strawberry Perl** for the vendored OpenSSL build (`winget install StrawberryPerl.StrawberryPerl`); macOS and Linux already ship with Perl.
 
 ```bash
 git clone https://github.com/sinaxhpm/submarine
