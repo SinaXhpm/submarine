@@ -1,0 +1,236 @@
+name: Release
+
+# Fires when you push a tag like v0.1.0. The job builds Submarine on
+# Windows, macOS, and Ubuntu, stamps the tag's version into Cargo.toml
+# and tauri.conf.json so the bundled binary's version matches the tag,
+# and uploads the installers/bundles as a draft GitHub Release.
+#
+# Triggering a release: locally run
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual button on the Actions tab — useful for sanity checks without
+  # cutting a real release. Choose any version string; nothing is published
+  # unless `publish_release` is true.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag (e.g. v0.1.0)"
+        required: true
+        default: "v0.0.0-test"
+      publish_release:
+        description: "Attach artifacts to a GitHub Release"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+# Faster, cheaper CI builds. Incremental compilation costs time + disk in
+# clean-checkout environments where there's nothing to be incremental
+# against; -D warnings would be great here but breaks too many crates,
+# so leave at default.
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: "always"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows: ships .msi (WiX) and .exe (NSIS). Both let the user
+          # double-click to install with no extra friction.
+          - platform: windows-latest
+            os_name: windows
+            bundles: "msi,nsis"
+            rust_target: x86_64-pc-windows-msvc
+
+          # macOS Apple Silicon. We produce both:
+          #   - Submarine.app (zipped → unzip + double-click, no DMG drag)
+          #   - Submarine_x.y.z_aarch64.dmg (classic DMG installer)
+          - platform: macos-latest
+            os_name: macos-arm64
+            bundles: "app,dmg"
+            rust_target: aarch64-apple-darwin
+
+          # macOS Intel. Same two formats. macos-13 still has Intel runners.
+          - platform: macos-13
+            os_name: macos-x64
+            bundles: "app,dmg"
+            rust_target: x86_64-apple-darwin
+
+          # Linux: AppImage only. Runs on any modern distro, no install
+          # required — chmod +x and double-click. Skipping .deb/.rpm to
+          # keep the matrix slim and avoid needing rpmbuild on the runner.
+          - platform: ubuntu-22.04
+            os_name: linux-x64
+            bundles: "appimage"
+            rust_target: x86_64-unknown-linux-gnu
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Compute the version string we'll stamp into Cargo.toml and
+      # tauri.conf.json. For tag pushes we use the tag (strip the leading
+      # 'v'); for manual runs we use the workflow input. The result is
+      # exposed to later steps via $GITHUB_ENV.
+      - name: Resolve version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="${{ github.event.inputs.version }}"
+          else
+            RAW="${{ github.ref_name }}"
+          fi
+          # Strip leading "v" — Cargo + Tauri want bare semver.
+          VERSION="${RAW#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Resolved release version: $VERSION"
+
+      # Stamp the version into Cargo.toml and tauri.conf.json so the
+      # bundled binary's about/version metadata matches the git tag.
+      # Without this, a v0.2.0 tag would still produce installers
+      # showing "0.1.0" inside Windows Add/Remove Programs and macOS's
+      # Get Info pane. Uses Node to avoid the cross-platform sed/awk
+      # quoting maze.
+      - name: Stamp version into manifests
+        shell: bash
+        run: |
+          node -e "
+            const fs=require('fs');
+            const v=process.env.VERSION;
+            // Cargo.toml: only the package.version line — leave dep versions alone.
+            const cargo=fs.readFileSync('src-tauri/Cargo.toml','utf8');
+            const next=cargo.replace(/^version *= *\".*\"/m, 'version = \"'+v+'\"');
+            fs.writeFileSync('src-tauri/Cargo.toml', next);
+            // tauri.conf.json: top-level version key.
+            const conf=JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json','utf8'));
+            conf.version=v;
+            fs.writeFileSync('src-tauri/tauri.conf.json', JSON.stringify(conf, null, 2)+'\n');
+            console.log('Stamped version', v);
+          "
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Linux-only: WebKit + AppImage tooling. The Tauri Linux build links
+      # webkit2gtk-4.1 and ships an AppImage built via `linuxdeploy` which
+      # needs librsvg + libsoup3.
+      - name: Install Linux deps
+        if: matrix.os_name == 'linux-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            patchelf \
+            file
+
+      - name: Install npm deps
+        run: npm ci
+
+      # We deliberately do NOT run `npm run build` here — tauri-action
+      # invokes the `beforeBuildCommand` defined in tauri.conf.json
+      # (which is `npm run build`) before the Rust build, so a manual
+      # invocation would just duplicate work and risk version drift
+      # between the two passes.
+      - name: Build Tauri bundles
+        # Pinned to v0 (major) — Tauri maintainers move that tag in lockstep
+        # with stable releases. For tighter reproducibility pin to a SHA.
+        uses: tauri-apps/tauri-action@v0
+        with:
+          args: --target ${{ matrix.rust_target }} --bundles ${{ matrix.bundles }}
+
+      # macOS: zip the .app bundle so a user can download a single file
+      # and just double-click. No DMG drag-to-Applications dance.
+      - name: Zip macOS .app
+        if: startsWith(matrix.os_name, 'macos')
+        run: |
+          APP_DIR="src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos"
+          cd "$APP_DIR"
+          # The .app folder is named after productName ("submarine").
+          # Wrap it in a versioned zip for the release asset name.
+          ARCH="${{ matrix.os_name }}"
+          ZIP_NAME="Submarine-${{ github.ref_name }}-${ARCH}.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent "submarine.app" "$ZIP_NAME"
+          echo "MAC_ZIP=$APP_DIR/$ZIP_NAME" >> $GITHUB_ENV
+
+      # Collect every artifact this job produced into one folder for upload.
+      - name: Stage artifacts (Windows)
+        if: matrix.os_name == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Get-ChildItem -Path "src-tauri/target/${{ matrix.rust_target }}/release/bundle" -Recurse -Include *.msi,*.exe |
+            Copy-Item -Destination artifacts/
+
+      - name: Stage artifacts (macOS)
+        if: startsWith(matrix.os_name, 'macos')
+        run: |
+          mkdir -p artifacts
+          cp "$MAC_ZIP" artifacts/
+          find "src-tauri/target/${{ matrix.rust_target }}/release/bundle/dmg" -name "*.dmg" -exec cp {} artifacts/ \; || true
+
+      - name: Stage artifacts (Linux)
+        if: matrix.os_name == 'linux-x64'
+        run: |
+          mkdir -p artifacts
+          find "src-tauri/target/${{ matrix.rust_target }}/release/bundle/appimage" -name "*.AppImage" -exec cp {} artifacts/ \;
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: submarine-${{ matrix.os_name }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  # Gather every platform's artifacts and attach them to a GitHub Release.
+  # Skips when triggered via workflow_dispatch unless `publish_release=true`.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish_release == 'true'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten into a single folder
+        run: |
+          mkdir -p release-files
+          find dist -type f \( -name "*.msi" -o -name "*.exe" -o -name "*.dmg" -o -name "*.app.zip" -o -name "*.AppImage" \) -exec cp {} release-files/ \;
+          ls -la release-files/
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Submarine ${{ github.ref_name }}
+          draft: true
+          generate_release_notes: true
+          files: release-files/*
