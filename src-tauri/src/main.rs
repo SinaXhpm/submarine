@@ -103,19 +103,24 @@ pub(crate) fn validate_profile_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-// Argon2id parameters for vault-key derivation. Tuned higher than the
-// library default (which is OWASP's password-HASHING recommendation,
-// borderline for a long-lived KDF):
+// Argon2id parameters for vault-key derivation:
 //   m_cost   64 MiB  — memory hardness; raises cost of GPU/ASIC attacks
-//   t_cost   3       — passes over the buffer; ~150ms on a modern laptop
-//   p_cost   4       — parallelism; uses 4 lanes if available, harmless on 1
+//   t_cost   2       — passes over the buffer; one extra pass over the
+//                      memory window after the initial fill, which gives
+//                      meaningful temporal hardness without tripling KDF
+//                      time. Two passes is the OWASP recommendation for
+//                      m=64MiB.
+//   p_cost   1       — single lane. Multi-lane parallelism doesn't make
+//                      offline attackers slower (they parallelise too)
+//                      and adds thread-spawn overhead on the user's side,
+//                      so we keep it at 1 to optimise unlock latency.
 //   output   32 B    — AES-256-GCM key length
-// Changing these invalidates every existing vault — derived key changes,
-// AES-GCM tag fails, vault won't decrypt. Only bump on a deliberate
-// re-keying migration.
+// Changing these invalidates every existing vault — the derived key
+// changes, AES-GCM tag verification fails, vault won't decrypt. Only
+// bump on a deliberate re-keying migration.
 const ARGON2_M_COST: u32 = 64 * 1024;
-const ARGON2_T_COST: u32 = 3;
-const ARGON2_P_COST: u32 = 4;
+const ARGON2_T_COST: u32 = 2;
+const ARGON2_P_COST: u32 = 1;
 
 fn derive_key(password: &str, salt_bytes: &[u8]) -> Result<[u8; 32], String> {
     let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
