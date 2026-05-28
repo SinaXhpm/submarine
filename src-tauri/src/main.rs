@@ -1636,49 +1636,55 @@ async fn initiate_connection(
         // protocol max for maximum_packet_size (russh enforces this).
         config.window_size = 8 * 1024 * 1024;
         config.maximum_packet_size = 65535;
-        // Widen the negotiation set to match what OpenSSH ships. The default
-        // russh `Preferred` only lists curve25519 + DH-G14-SHA256 for KEX and
-        // Ed25519 + ECDSA-P256 for host keys — fine for modern boxes but
-        // trips "No common key/kex algorithm" against older servers, embedded
-        // SSH stacks, and many shared hosts whose host key is still RSA. We
-        // add the legacy DH groups and the full RSA host-key family so the
-        // client can talk to essentially any SSH server still in production.
+        // Widen the negotiation set to match what OpenSSH ships — but only
+        // in builds that include the OpenSSL backend (release CI via the
+        // `full-ssh-algos` feature). russh's default `Preferred` only lists
+        // curve25519 + DH-G14-SHA256 for KEX and Ed25519 + ECDSA-P256 for
+        // host keys, which fails "No common key/kex algorithm" against
+        // older servers, embedded SSH stacks, and any shared host still
+        // using RSA host keys. The full list below adds legacy DH groups,
+        // the entire RSA host-key family, and the HMAC-SHA1 MAC variants.
         // Order is strongest-first; russh negotiates by picking the first
-        // entry from our list that the server also offers.
-        config.preferred = russh::Preferred {
-            kex: &[
-                russh::kex::CURVE25519,
-                russh::kex::CURVE25519_PRE_RFC_8731,
-                russh::kex::DH_G14_SHA256,
-                russh::kex::DH_G14_SHA1,
-                russh::kex::DH_G1_SHA1,
-                russh::kex::EXTENSION_SUPPORT_AS_CLIENT,
-                russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT,
-            ],
-            key: &[
-                russh_keys::key::ED25519,
-                russh_keys::key::ECDSA_SHA2_NISTP256,
-                russh_keys::key::RSA_SHA2_512,
-                russh_keys::key::RSA_SHA2_256,
-                russh_keys::key::SSH_RSA,
-            ],
-            cipher: &[
-                russh::cipher::CHACHA20_POLY1305,
-                russh::cipher::AES_256_GCM,
-                russh::cipher::AES_256_CTR,
-                russh::cipher::AES_192_CTR,
-                russh::cipher::AES_128_CTR,
-            ],
-            mac: &[
-                russh::mac::HMAC_SHA512_ETM,
-                russh::mac::HMAC_SHA256_ETM,
-                russh::mac::HMAC_SHA512,
-                russh::mac::HMAC_SHA256,
-                russh::mac::HMAC_SHA1_ETM,
-                russh::mac::HMAC_SHA1,
-            ],
-            compression: &["none", "zlib", "zlib@openssh.com"],
-        };
+        // entry from our list that the server also offers. Default (local
+        // debug) builds use russh's defaults, which is fine for connecting
+        // to any modern server.
+        #[cfg(feature = "full-ssh-algos")]
+        {
+            config.preferred = russh::Preferred {
+                kex: &[
+                    russh::kex::CURVE25519,
+                    russh::kex::CURVE25519_PRE_RFC_8731,
+                    russh::kex::DH_G14_SHA256,
+                    russh::kex::DH_G14_SHA1,
+                    russh::kex::DH_G1_SHA1,
+                    russh::kex::EXTENSION_SUPPORT_AS_CLIENT,
+                    russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT,
+                ],
+                key: &[
+                    russh_keys::key::ED25519,
+                    russh_keys::key::ECDSA_SHA2_NISTP256,
+                    russh_keys::key::RSA_SHA2_512,
+                    russh_keys::key::RSA_SHA2_256,
+                    russh_keys::key::SSH_RSA,
+                ],
+                cipher: &[
+                    russh::cipher::CHACHA20_POLY1305,
+                    russh::cipher::AES_256_GCM,
+                    russh::cipher::AES_256_CTR,
+                    russh::cipher::AES_192_CTR,
+                    russh::cipher::AES_128_CTR,
+                ],
+                mac: &[
+                    russh::mac::HMAC_SHA512_ETM,
+                    russh::mac::HMAC_SHA256_ETM,
+                    russh::mac::HMAC_SHA512,
+                    russh::mac::HMAC_SHA256,
+                    russh::mac::HMAC_SHA1_ETM,
+                    russh::mac::HMAC_SHA1,
+                ],
+                compression: &["none", "zlib", "zlib@openssh.com"],
+            };
+        }
         let config = Arc::new(config);
         
         let connect_future = client::connect_stream(config, StreamWrapper(stream), handler);
@@ -1698,6 +1704,20 @@ async fn initiate_connection(
                             session.authenticate_publickey(&effective_user, key_arc).await
                         }
                         Err(e) => {
+                            // RSA private keys only work in builds that include the
+                            // OpenSSL backend (release CI). Local debug builds skip
+                            // OpenSSL to stay Perl-free, so surface a targeted hint
+                            // instead of the raw "Unsupported key type rsa" string.
+                            #[cfg(not(feature = "full-ssh-algos"))]
+                            {
+                                let err_str = e.to_string();
+                                if err_str.contains("Unsupported key type rsa")
+                                    || err_str.contains("rsa")
+                                    || private_key.contains("RSA PRIVATE KEY")
+                                {
+                                    emit_log("RSA private keys aren't supported in this debug build — use Ed25519 for local testing, or grab a release build from GitHub for full RSA support.", "error");
+                                }
+                            }
                             emit_log(&format!("Failed to parse private key: {}", e), "error");
                             Err(russh::Error::from(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,

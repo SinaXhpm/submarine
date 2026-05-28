@@ -159,9 +159,13 @@ jobs:
       - name: Build Tauri bundles
         # Pinned to v0 (major) — Tauri maintainers move that tag in lockstep
         # with stable releases. For tighter reproducibility pin to a SHA.
+        # `--features full-ssh-algos` enables the OpenSSL-backed russh
+        # backend so release binaries can talk to RSA-host-key servers
+        # (the bulk of older Linux + shared hosts). Default `cargo build`
+        # locally stays Perl-free; only CI pulls in OpenSSL.
         uses: tauri-apps/tauri-action@v0
         with:
-          args: --target ${{ matrix.rust_target }} --bundles ${{ matrix.bundles }}
+          args: --target ${{ matrix.rust_target }} --bundles ${{ matrix.bundles }} --features full-ssh-algos
 
       # macOS: zip the .app bundle so a user can download a single file
       # and just double-click. No DMG drag-to-Applications dance.

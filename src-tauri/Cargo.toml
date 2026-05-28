@@ -9,6 +9,23 @@ rust-version = "1.70"
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }
 
+[features]
+# Default build is OpenSSL-free so it compiles on any machine without Perl /
+# system libcrypto. The trade-off is reduced SSH compatibility: russh's
+# default only negotiates Ed25519 / ECDSA-P256 host keys + modern KEX /
+# MAC algorithms, so older Linux servers and most shared hosts still using
+# RSA host keys won't connect ("No common key algorithm").
+default = []
+# Turned on by the release workflow (tauri-action `args: ... --features
+# full-ssh-algos`) so the shipped binaries can talk to essentially any SSH
+# server in production: full RSA host-key family, legacy DH groups, the
+# older HMAC-SHA1 family. Pulls in russh's openssl backend plus a vendored
+# (statically-linked, built-from-source) libcrypto so the resulting binary
+# has no runtime libssl dependency. Cost is a one-time perl + C compiler
+# requirement on the build host, which is why we don't make it default —
+# developers debugging locally shouldn't need to install Perl.
+full-ssh-algos = ["russh/openssl", "russh-keys/openssl", "dep:openssl-sys"]
+
 [dependencies]
 tauri = { version = "2.1", features = [] }
 hex = "0.4"
@@ -21,18 +38,12 @@ aes-gcm = "0.10"
 rand = "0.8"
 rand_core = { version = "0.6", features = ["getrandom"] }
 directories = "5.0"
-# `openssl` feature unlocks RSA host-key + RSA client-key support
-# (rsa-sha2-512, rsa-sha2-256, ssh-rsa). Without it russh only negotiates
-# Ed25519 / ECDSA-P256 host keys, which excludes most older Linux servers
-# and shared hosts → "No common key algorithm" at handshake time.
-russh = { version = "0.40.2", features = ["openssl"] }
-russh-keys = { version = "0.40.1", features = ["openssl"] }
-# Force a vendored, statically-linked libcrypto built from source so the
-# release binary doesn't depend on whatever OpenSSL the user's machine
-# happens to have. Self-contained installer; no "missing libssl.so.X" bug
-# reports. Cost: needs perl on the build host (Strawberry on Windows,
-# system perl on macOS/Linux — both preinstalled on github runners).
-openssl-sys = { version = "0.9", features = ["vendored"] }
+# OpenSSL-backed features (RSA host keys, legacy KEX, full MAC suite) are
+# gated behind the `full-ssh-algos` feature so the default `cargo build`
+# stays Perl-free for local debugging. See the [features] block above.
+russh = "0.40.2"
+russh-keys = "0.40.1"
+openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 ssh-key = { version = "0.6", features = ["alloc", "encryption", "getrandom", "ed25519", "rsa"] }
 tokio-socks = "0.5"
 async-http-proxy = { version = "1.2", features = ["runtime-tokio"] }
