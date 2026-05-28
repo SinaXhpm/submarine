@@ -40,9 +40,13 @@ export const SessionView = ({ session, onClose, addLog }: any) => {
   const isCompact = useIsCompact();
   // Width of the right-side tool pane in pixels. The divider drag updates this
   // and we sync it to localStorage so subsequent sessions remember the split.
+  // First-time default is a quarter of the current window width — looks right
+  // across both narrow and wide monitors without us picking a magic pixel.
   const [toolPanelWidth, setToolPanelWidth] = useState<number>(() => {
     const saved = parseInt(localStorage.getItem('submarine-tool-panel-width') || '', 10);
-    return Number.isFinite(saved) && saved >= 240 ? saved : 420;
+    if (Number.isFinite(saved) && saved >= 240) return saved;
+    const quarter = Math.round((window.innerWidth || 1440) / 4);
+    return Math.max(240, Math.min(900, quarter));
   });
 
   const initiatedRef = useRef(false);

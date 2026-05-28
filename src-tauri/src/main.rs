@@ -3264,6 +3264,11 @@ fn main() {
     }
 
     tauri::Builder::default()
+        // Save/restore the main window's last size + position to a JSON file
+        // in app_data_dir. Keeps the user's preferred geometry across launches
+        // without us having to wire setSize/setPosition by hand. Plain plugin —
+        // it intercepts window events; no JS-facing commands to lock down.
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(DbState { conn: std::sync::Arc::new(StdMutex::new(None)), master_key: StdMutex::new(None), salt: StdMutex::new(None), db_path: StdMutex::new(None), active_profile: StdMutex::new(None) })
         .manage(SshState::new())
         // Monitoring state is its own root-level Tauri-managed value, separate
