@@ -9,6 +9,29 @@ rust-version = "1.70"
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }
 
+# Compile crypto + compression dependencies with full optimization even
+# in `cargo build` (debug). Without this, `npm run tauri dev` runs the
+# Argon2 KDF unoptimised — vault unlock takes 5-10x longer (1.5-3 s vs
+# 200-400 ms) because the inner mixing loops aren't vectorised. The
+# rest of our own code stays debug-buildable, so iteration speed and
+# panic-on-overflow assertions are unaffected.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.aes-gcm]
+opt-level = 3
+[profile.dev.package.aes]
+opt-level = 3
+[profile.dev.package.ghash]
+opt-level = 3
+[profile.dev.package.zstd-safe]
+opt-level = 3
+[profile.dev.package.zstd-sys]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+
 [features]
 # Default build is OpenSSL-free so it compiles on any machine without Perl /
 # system libcrypto. The trade-off is reduced SSH compatibility: russh's
