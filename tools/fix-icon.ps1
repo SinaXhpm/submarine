@@ -25,14 +25,13 @@ param(
     # etc., and bicubic interpolation produces noticeably sharper small
     # sizes when fed a 1024 source instead of the raw cropped bbox.
     [int]    $TargetSize = 1024,
-    # A solid rounded backdrop that fills the canvas, so a landscape
-    # logo (like the submarine artwork) doesn't leave 40% empty space
-    # top + bottom in the taskbar slot. Pass -NoBackdrop to keep the
-    # original transparent-canvas behaviour.
+    # A solid circular backdrop that gives the logo visual presence in
+    # the taskbar slot. The canvas corners stay transparent, so the
+    # icon reads as a free-floating disc rather than a square. Pass
+    # -NoBackdrop to keep the original transparent-canvas behaviour.
     [switch] $NoBackdrop,
     [string] $BackdropColor = '#0E1116',  # near-black, matches the app shell
-    [double] $BackdropInsetPct = 0.02,    # 2% of canvas tucked in from each edge
-    [double] $BackdropRadiusPct = 0.22    # corner radius as fraction of canvas
+    [double] $BackdropInsetPct = 0.02     # 2% of canvas tucked in from each edge
 )
 
 Add-Type -AssemblyName System.Drawing
@@ -130,17 +129,11 @@ try {
             if (!$NoBackdrop) {
                 $inset = [int]([Math]::Round($TargetSize * $BackdropInsetPct))
                 $bgSize = $TargetSize - 2 * $inset
-                $bgR = [int]([Math]::Round($TargetSize * $BackdropRadiusPct))
-                $bgR = [Math]::Min($bgR, [int]($bgSize / 2))
 
                 $bgPath = New-Object System.Drawing.Drawing2D.GraphicsPath
-                # Build a rounded-square path manually: four arcs + closure.
-                $d = $bgR * 2
-                $bgPath.AddArc($inset,                   $inset,                   $d, $d, 180, 90) | Out-Null
-                $bgPath.AddArc($inset + $bgSize - $d,    $inset,                   $d, $d, 270, 90) | Out-Null
-                $bgPath.AddArc($inset + $bgSize - $d,    $inset + $bgSize - $d,    $d, $d, 0,   90) | Out-Null
-                $bgPath.AddArc($inset,                   $inset + $bgSize - $d,    $d, $d, 90,  90) | Out-Null
-                $bgPath.CloseFigure()
+                # Single inscribed circle; everything outside it stays
+                # transparent so the icon reads as a free-floating disc.
+                $bgPath.AddEllipse($inset, $inset, $bgSize, $bgSize) | Out-Null
 
                 $bgCol = [System.Drawing.ColorTranslator]::FromHtml($BackdropColor)
                 $bgBrush = New-Object System.Drawing.SolidBrush $bgCol
@@ -149,9 +142,11 @@ try {
                 $bgPath.Dispose()
             }
 
-            # Logo on top, centred, scaled to ~92% of the canvas so the
-            # backdrop's rounded corners stay visible around the artwork.
-            $logoFit = [int]([Math]::Round($TargetSize * 0.92))
+            # Logo on top, centred. A circle has 70.7% usable inscribed
+            # square; scaling the logo to ~70% of the canvas keeps the
+            # artwork comfortably inside the disc without bleeding past
+            # its curved edge.
+            $logoFit = [int]([Math]::Round($TargetSize * 0.70))
             $logoOff = [int](($TargetSize - $logoFit) / 2)
             $gf.DrawImage($dst, $logoOff, $logoOff, $logoFit, $logoFit)
         } finally {
