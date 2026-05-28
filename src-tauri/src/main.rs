@@ -3127,17 +3127,27 @@ async fn monitor_resume_all(
 }
 
 fn main() {
-    // Tauri 2 on Linux embeds webkit2gtk-4.1, whose default renderer path uses
-    // DMA-BUF + EGL — and that path crashes ("EGL_BAD_PARAMETER … Aborting",
-    // SIGABRT inside WebKitWebProcess) on Mesa ≥ 24 / WebKit ≥ 2.44 with a
-    // wide range of GPUs (intel, amdgpu, nvidia under Wayland, llvmpipe in
-    // VMs). The known-good workaround is to flip the renderer to the older
-    // GLES path before WebKit spawns its child process; once a child inherits
-    // a flipped env, every subsequent webview behaves. We also disable the
-    // separate compositing fast-path as belt-and-braces — costs nothing and
-    // covers the residual class of "EGL surface init failed" reports.
+    // Tauri 2 on Linux embeds webkit2gtk-4.1. Two failure modes have to be
+    // headed off before the WebKit child process spawns, because once it's
+    // up the env it inherited is the only one it sees:
     //
-    // Refs: WebKit bug #258834, Tauri issue tauri-apps/tauri#9304.
+    //   1. The DMA-BUF + EGL renderer that WebKit defaults to crashes with
+    //      "EGL_BAD_PARAMETER … Aborting" / SIGABRT on Mesa ≥ 24 across
+    //      most GPUs. Flipping it off forces the older GLES path.
+    //      (WebKit #258834, tauri-apps/tauri#9304)
+    //
+    //   2. On Wayland sessions with Mesa ≥ 24 (Fedora 40+, KDE Plasma 6,
+    //      GNOME 46+) the bundled webkit2gtk-4.1's eglGetDisplay() against
+    //      a wl_display still aborts even with the DMA-BUF renderer off,
+    //      because the bundled libwayland-egl ABI predates the host Mesa.
+    //      Routing GTK through XWayland avoids the mismatched Wayland-EGL
+    //      handshake entirely and keeps the app usable on every desktop.
+    //      The trade-off is XWayland's slightly fuzzier HiDPI scaling,
+    //      which is acceptable in exchange for "the app actually opens".
+    //
+    // Every override is gated on `var_os(...).is_none()` so power users
+    // (or distros that ship a patched WebKit) can opt back in by exporting
+    // the variable themselves before launching.
     #[cfg(target_os = "linux")]
     {
         if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
@@ -3145,6 +3155,9 @@ fn main() {
         }
         if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
             std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        }
+        if std::env::var_os("GDK_BACKEND").is_none() {
+            std::env::set_var("GDK_BACKEND", "x11");
         }
     }
 
