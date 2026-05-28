@@ -24,14 +24,7 @@ param(
     # Final emit size. tauri icon will downscale from this to 16/32/48/256
     # etc., and bicubic interpolation produces noticeably sharper small
     # sizes when fed a 1024 source instead of the raw cropped bbox.
-    [int]    $TargetSize = 1024,
-    # A solid circular backdrop that gives the logo visual presence in
-    # the taskbar slot. The canvas corners stay transparent, so the
-    # icon reads as a free-floating disc rather than a square. Pass
-    # -NoBackdrop to keep the original transparent-canvas behaviour.
-    [switch] $NoBackdrop,
-    [string] $BackdropColor = '#0E1116',  # near-black, matches the app shell
-    [double] $BackdropInsetPct = 0.02     # 2% of canvas tucked in from each edge
+    [int]    $TargetSize = 1024
 )
 
 Add-Type -AssemblyName System.Drawing
@@ -114,9 +107,11 @@ try {
         } finally {
             $g.Dispose()
         }
-        # ----- Final composite: upscale to $TargetSize and (optionally)
-        #       lay a rounded backdrop under the logo so the canvas isn't
-        #       40% empty in the taskbar slot.
+        # ----- Final emit: upscale the centred logo to $TargetSize so
+        #       tauri icon has a high-quality source to downsample from.
+        #       No backdrop / fill — the canvas around the artwork stays
+        #       transparent; the artwork itself fills its longest axis
+        #       edge-to-edge.
         $final = New-Object System.Drawing.Bitmap $TargetSize, $TargetSize, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
         $gf = [System.Drawing.Graphics]::FromImage($final)
         try {
@@ -125,38 +120,14 @@ try {
             $gf.PixelOffsetMode    = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
             $gf.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
             $gf.Clear([System.Drawing.Color]::Transparent)
-
-            if (!$NoBackdrop) {
-                $inset = [int]([Math]::Round($TargetSize * $BackdropInsetPct))
-                $bgSize = $TargetSize - 2 * $inset
-
-                $bgPath = New-Object System.Drawing.Drawing2D.GraphicsPath
-                # Single inscribed circle; everything outside it stays
-                # transparent so the icon reads as a free-floating disc.
-                $bgPath.AddEllipse($inset, $inset, $bgSize, $bgSize) | Out-Null
-
-                $bgCol = [System.Drawing.ColorTranslator]::FromHtml($BackdropColor)
-                $bgBrush = New-Object System.Drawing.SolidBrush $bgCol
-                $gf.FillPath($bgBrush, $bgPath)
-                $bgBrush.Dispose()
-                $bgPath.Dispose()
-            }
-
-            # Logo on top, centred. A circle has 70.7% usable inscribed
-            # square; scaling the logo to ~70% of the canvas keeps the
-            # artwork comfortably inside the disc without bleeding past
-            # its curved edge.
-            $logoFit = [int]([Math]::Round($TargetSize * 0.70))
-            $logoOff = [int](($TargetSize - $logoFit) / 2)
-            $gf.DrawImage($dst, $logoOff, $logoOff, $logoFit, $logoFit)
+            $gf.DrawImage($dst, 0, 0, $TargetSize, $TargetSize)
         } finally {
             $gf.Dispose()
         }
         $final.Save($Output, [System.Drawing.Imaging.ImageFormat]::Png)
         $final.Dispose()
         $dst.Dispose()
-        $backdropNote = if ($NoBackdrop) { "no backdrop" } else { "backdrop $BackdropColor" }
-        Write-Output ("Cropped + composited: source {0}x{1} -> logo {2}x{2} -> output {3}x{3} ({4})" -f $W, $H, $size, $TargetSize, $backdropNote)
+        Write-Output ("Cropped + upscaled: source {0}x{1} -> logo {2}x{2} -> output {3}x{3}" -f $W, $H, $size, $TargetSize)
     } else {
         # ----- Fall back: source has solid corners, apply circular mask -----
         $size = [Math]::Max($W, $H)
