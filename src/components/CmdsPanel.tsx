@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, RefreshCw, Search, X, Terminal, StickyNote, ClipboardCopy, ChevronDown, ChevronRight } from "lucide-react";
+import { Play, RefreshCw, Search, X, Terminal, StickyNote, ClipboardCopy, ChevronDown, ChevronRight, Pencil, Check } from "lucide-react";
 
 // Side panel that opens from a terminal session and surfaces *both* the
 // user's saved Quick Commands and their Notes side by side. Commands have a
@@ -34,6 +34,14 @@ export const CmdsPanel = ({ activeTab, onClose }: { activeTab: string; onClose: 
   const [searchQuery, setSearchQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [expandedNoteId, setExpandedNoteId] = useState<number | null>(null);
+  // Per-note editor state. Held alongside expandedNoteId so the user can
+  // expand to read without entering edit mode (and the textarea instance
+  // is only mounted while editing, avoiding wasted DOM nodes for long
+  // lists).
+  const [editingNoteId, setEditingNoteId] = useState<number | null>(null);
+  const [editingTitle, setEditingTitle] = useState("");
+  const [editingBody, setEditingBody] = useState("");
+  const [savingNote, setSavingNote] = useState(false);
 
   const fetchAll = async () => {
     setLoading(true);
@@ -61,7 +69,47 @@ export const CmdsPanel = ({ activeTab, onClose }: { activeTab: string; onClose: 
   useEffect(() => {
     setSearchQuery("");
     setExpandedNoteId(null);
+    setEditingNoteId(null);
   }, [tab]);
+
+  const beginEditNote = (n: NoteItem) => {
+    setEditingNoteId(n.id);
+    setEditingTitle(n.title || "");
+    setEditingBody(n.body || "");
+    setExpandedNoteId(n.id);
+  };
+
+  const cancelEditNote = () => {
+    setEditingNoteId(null);
+    setEditingTitle("");
+    setEditingBody("");
+  };
+
+  const saveEditNote = async () => {
+    if (editingNoteId == null || savingNote) return;
+    setSavingNote(true);
+    try {
+      await invoke("edit_note", {
+        id: editingNoteId,
+        title: editingTitle,
+        body: editingBody,
+      });
+      // Patch the local cache so the UI updates without a round-trip.
+      // We still refetch in the background to stay in sync if the user
+      // edits the same profile from another window.
+      setNotes((prev) =>
+        prev.map((n) =>
+          n.id === editingNoteId ? { ...n, title: editingTitle, body: editingBody } : n
+        )
+      );
+      cancelEditNote();
+      fetchAll();
+    } catch (e) {
+      console.error("Failed to save note:", e);
+    } finally {
+      setSavingNote(false);
+    }
+  };
 
   const runCommand = async (content: string) => {
     if (!activeTab) return;
@@ -251,27 +299,82 @@ export const CmdsPanel = ({ activeTab, onClose }: { activeTab: string; onClose: 
                 </button>
 
                 {expanded && (
-                  <div className="px-3 pb-3 -mt-1 space-y-2">
-                    <pre className="p-2.5 bg-black/40 rounded border border-white/5 font-sans text-[11px] text-zinc-300 whitespace-pre-wrap leading-relaxed max-h-64 overflow-y-auto custom-scrollbar">
-                      {n.body || <span className="italic text-zinc-600">(empty)</span>}
-                    </pre>
-                    <div className="flex gap-1.5">
-                      <button
-                        onClick={() => copyToClipboard(n.body || "")}
-                        className="flex-1 h-7 rounded-lg bg-white/[0.04] border border-white/10 hover:bg-white/10 hover:border-white/20 text-zinc-300 hover:text-white flex items-center justify-center gap-1.5 text-[10px] font-bold transition-all"
-                        title="Copy to clipboard"
-                      >
-                        <ClipboardCopy size={11} /> Copy
-                      </button>
-                      <button
-                        onClick={() => pasteNote(n.body || "")}
-                        className="flex-1 h-7 rounded-lg bg-primary/10 text-primary border border-primary/20 hover:bg-primary hover:text-zinc-950 hover:border-primary flex items-center justify-center gap-1.5 text-[10px] font-bold transition-all"
-                        title="Paste body into active terminal (no auto-execute)"
-                      >
-                        <Play size={11} fill="currentColor" /> Paste
-                      </button>
+                  editingNoteId === n.id ? (
+                    // Inline editor — same layout footprint as the read mode
+                    // so swapping in/out doesn't reflow the surrounding list.
+                    // Ctrl/Cmd+Enter is the textarea power-user shortcut for
+                    // Save; Escape always cancels.
+                    <div className="px-3 pb-3 -mt-1 space-y-2">
+                      <input
+                        type="text"
+                        value={editingTitle}
+                        onChange={(e) => setEditingTitle(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") { e.preventDefault(); cancelEditNote(); }
+                        }}
+                        placeholder="Title"
+                        className="w-full h-7 px-2 bg-black/40 border border-white/10 rounded text-[11px] text-white placeholder-zinc-600 focus:outline-none focus:border-primary/50"
+                        autoFocus
+                      />
+                      <textarea
+                        value={editingBody}
+                        onChange={(e) => setEditingBody(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") { e.preventDefault(); cancelEditNote(); }
+                          if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); saveEditNote(); }
+                        }}
+                        placeholder="Note body — markdown, paths, snippets…"
+                        rows={6}
+                        className="w-full p-2 bg-black/40 border border-white/10 rounded font-sans text-[11px] text-zinc-200 placeholder-zinc-600 leading-relaxed resize-y focus:outline-none focus:border-primary/50 custom-scrollbar"
+                      />
+                      <div className="flex gap-1.5">
+                        <button
+                          onClick={cancelEditNote}
+                          disabled={savingNote}
+                          className="flex-1 h-7 rounded-lg bg-white/[0.04] border border-white/10 hover:bg-white/10 hover:border-white/20 text-zinc-300 hover:text-white flex items-center justify-center gap-1.5 text-[10px] font-bold transition-all disabled:opacity-50"
+                        >
+                          <X size={11} /> Cancel
+                        </button>
+                        <button
+                          onClick={saveEditNote}
+                          disabled={savingNote}
+                          className="flex-1 h-7 rounded-lg bg-primary/10 text-primary border border-primary/20 hover:bg-primary hover:text-zinc-950 hover:border-primary flex items-center justify-center gap-1.5 text-[10px] font-bold transition-all disabled:opacity-50"
+                          title="Save (Ctrl+Enter)"
+                        >
+                          {savingNote ? <RefreshCw size={11} className="animate-spin" /> : <Check size={11} />} Save
+                        </button>
+                      </div>
                     </div>
-                  </div>
+                  ) : (
+                    <div className="px-3 pb-3 -mt-1 space-y-2">
+                      <pre className="p-2.5 bg-black/40 rounded border border-white/5 font-sans text-[11px] text-zinc-300 whitespace-pre-wrap leading-relaxed max-h-64 overflow-y-auto custom-scrollbar">
+                        {n.body || <span className="italic text-zinc-600">(empty)</span>}
+                      </pre>
+                      <div className="flex gap-1.5">
+                        <button
+                          onClick={() => copyToClipboard(n.body || "")}
+                          className="flex-1 h-7 rounded-lg bg-white/[0.04] border border-white/10 hover:bg-white/10 hover:border-white/20 text-zinc-300 hover:text-white flex items-center justify-center gap-1.5 text-[10px] font-bold transition-all"
+                          title="Copy to clipboard"
+                        >
+                          <ClipboardCopy size={11} /> Copy
+                        </button>
+                        <button
+                          onClick={() => pasteNote(n.body || "")}
+                          className="flex-1 h-7 rounded-lg bg-white/[0.04] border border-white/10 hover:bg-white/10 hover:border-white/20 text-zinc-300 hover:text-white flex items-center justify-center gap-1.5 text-[10px] font-bold transition-all"
+                          title="Paste body into active terminal (no auto-execute)"
+                        >
+                          <Play size={11} fill="currentColor" /> Paste
+                        </button>
+                        <button
+                          onClick={() => beginEditNote(n)}
+                          className="flex-1 h-7 rounded-lg bg-primary/10 text-primary border border-primary/20 hover:bg-primary hover:text-zinc-950 hover:border-primary flex items-center justify-center gap-1.5 text-[10px] font-bold transition-all"
+                          title="Edit note inline"
+                        >
+                          <Pencil size={11} /> Edit
+                        </button>
+                      </div>
+                    </div>
+                  )
                 )}
               </div>
             );
