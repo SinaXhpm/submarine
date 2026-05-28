@@ -3,7 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import {
   Plus, X, RefreshCw, Terminal, Key, Trash2,
-  ArrowLeftRight, Shield, User, Cpu, TerminalSquare, List, Edit2
+  ArrowLeftRight, Shield, User, Cpu, TerminalSquare, List, Edit2,
+  StickyNote, Search
 } from "lucide-react";
 
 import ProfileSelectPage from "./components/ProfileSelectPage";
@@ -55,6 +56,11 @@ function DesktopApp() {
   const [logs, setLogs] = useState<{ msg: string, type: string, time: string }[]>([]);
   const [isCommandPanelOpen, setIsCommandPanelOpen] = useState(false);
   const [editCommandData, setEditCommandData] = useState<{ id: number | null, title: string, content: string }>({ id: null, title: "", content: "" });
+
+  const [notes, setNotes] = useState<any[]>([]);
+  const [isNotePanelOpen, setIsNotePanelOpen] = useState(false);
+  const [editNoteData, setEditNoteData] = useState<{ id: number | null, title: string, body: string }>({ id: null, title: "", body: "" });
+  const [noteQuery, setNoteQuery] = useState("");
 
   const [isCredPanelOpen, setIsCredPanelOpen] = useState(false);
   const [editCredData, setEditCredData] = useState<any>({ id: null, name: "", auth_type: "password", username: "", password: "", key_id: null });
@@ -162,6 +168,10 @@ function DesktopApp() {
     try { setCommands((await invoke("get_commands")) as any[]); }
     catch (e) { addLog(`SYNC_COMMANDS: ${e}`, "error"); }
   };
+  const refreshNotes = async () => {
+    try { setNotes((await invoke("get_notes")) as any[]); }
+    catch (e) { addLog(`SYNC_NOTES: ${e}`, "error"); }
+  };
   const refreshAll = async () => {
     await Promise.all([
       refreshServers(),
@@ -169,6 +179,7 @@ function DesktopApp() {
       refreshSshKeys(),
       refreshFolders(),
       refreshCommands(),
+      refreshNotes(),
     ]);
   };
 
@@ -470,6 +481,68 @@ function DesktopApp() {
               </div>
             ))}
 
+            {activeView === "notes" && (() => {
+              const q = noteQuery.trim().toLowerCase();
+              const visible = q
+                ? notes.filter(n =>
+                    (n.title || "").toLowerCase().includes(q) ||
+                    (n.body || "").toLowerCase().includes(q))
+                : notes;
+              return (
+                <div className="flex-1 flex flex-col p-4 sm:p-8 space-y-5 sm:space-y-6 animate-in overflow-y-auto custom-scrollbar">
+                  <header className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 border-b border-zinc-700 pb-5 sm:pb-6 shrink-0">
+                    <div className="min-w-0">
+                      <h2 className="text-[18px] sm:text-[22px] font-bold text-white tracking-tight">Notes</h2>
+                      <p className="hidden sm:block text-[13px] text-zinc-400">Anything you want to remember, stored with this profile.</p>
+                    </div>
+                    <div className="flex gap-2 items-center">
+                      <div className="relative">
+                        <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-500 pointer-events-none" />
+                        <input
+                          type="text"
+                          value={noteQuery}
+                          onChange={(e) => setNoteQuery(e.target.value)}
+                          placeholder="Search title or content…"
+                          className="h-9 pl-7 pr-3 w-44 sm:w-56 bg-black/40 border border-white/10 rounded-xl text-[12px] text-zinc-200 placeholder:text-zinc-600 outline-none focus:border-primary/40"
+                        />
+                      </div>
+                      <button
+                        onClick={() => { setEditNoteData({ id: null, title: "", body: "" }); setIsNotePanelOpen(true); }}
+                        title="Add Note"
+                        className="h-9 px-3 sm:px-4 bg-primary text-black text-[12px] sm:text-[13px] font-bold rounded-xl shadow-lg shadow-primary/20 flex items-center gap-1.5 transition-all hover:bg-primary self-start sm:self-auto"
+                      >
+                        <Plus size={14} /> Add Note
+                      </button>
+                    </div>
+                  </header>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 pb-10">
+                    {visible.length === 0 ? (
+                      <div className="col-span-full py-12 text-center text-zinc-500 text-[14px] italic border border-dashed border-white/10 rounded-2xl">
+                        {q ? `No notes match "${noteQuery}".` : "No notes yet."}
+                      </div>
+                    ) : (
+                      visible.map(n => (
+                        <div key={n.id} className="bg-[#16161a] border border-white/5 rounded-2xl p-4 flex flex-col group relative overflow-hidden shadow-inner h-[170px]">
+                          <div className="flex justify-between items-start mb-2 gap-2">
+                            <h3 className="text-[15px] font-bold text-primary tracking-tight truncate flex-1">{n.title || "Untitled"}</h3>
+                            <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                              <button onClick={() => { setEditNoteData({ id: n.id, title: n.title || "", body: n.body || "" }); setIsNotePanelOpen(true); }} className="text-zinc-500 hover:text-white transition-colors"><Edit2 size={14} /></button>
+                              <button onClick={() => invoke("delete_note", { id: n.id }).then(() => refreshNotes())} className="text-zinc-500 hover:text-red-500 transition-colors"><Trash2 size={14} /></button>
+                            </div>
+                          </div>
+                          <div className="bg-black/30 rounded-xl p-3 border border-white/5 flex-1 relative group-hover:border-primary/20 transition-colors overflow-hidden cursor-pointer"
+                               onClick={() => { setEditNoteData({ id: n.id, title: n.title || "", body: n.body || "" }); setIsNotePanelOpen(true); }}>
+                            <pre className="text-[12px] text-zinc-400 whitespace-pre-wrap leading-relaxed line-clamp-4 font-sans">{n.body}</pre>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+
             {activeView === "commands" && (
               <div className="flex-1 flex flex-col p-4 sm:p-8 space-y-5 sm:space-y-6 animate-in overflow-y-auto custom-scrollbar">
                 <header className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 border-b border-zinc-700 pb-5 sm:pb-6 shrink-0">
@@ -669,6 +742,56 @@ function DesktopApp() {
                   addLog(`COMMAND_SAVE_ERROR: ${e}`, "error");
                 }
               }} 
+              className="w-full h-10 bg-primary text-black font-bold rounded-lg text-[13px] tracking-tight hover:bg-primary transition-all active:scale-[0.98] shadow-[0_0_15px_rgba(var(--primary),0.2)] flex items-center justify-center gap-2"
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className={`fixed inset-0 z-50 transition-all duration-500 flex justify-end ${isNotePanelOpen ? 'bg-black/80 backdrop-blur-sm' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsNotePanelOpen(false)}>
+        <div className={`w-full max-w-[480px] bg-[#09090b] border-l border-white/5 shadow-2xl transition-all duration-500 h-full flex flex-col ${isNotePanelOpen ? 'translate-x-0' : 'translate-x-full'}`} onClick={(e) => e.stopPropagation()}>
+          <div className="flex justify-between items-center p-6 border-b border-white/5 shrink-0">
+            <h2 className="text-[15px] font-bold text-white tracking-tight flex items-center gap-2">
+              <StickyNote size={18} className="text-primary" />
+              {editNoteData.id ? "Edit note" : "New note"}
+            </h2>
+            <button onClick={() => { setIsNotePanelOpen(false); setFormError(""); }} className="w-7 h-7 flex items-center justify-center text-zinc-500 hover:text-white bg-black border border-white/5 hover:bg-white/10 rounded-full transition-all">
+              <X size={16} />
+            </button>
+          </div>
+          <div className="p-6 flex-1 overflow-y-auto space-y-6 flex flex-col">
+            {formError && <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-500 text-[12px] font-bold">{formError}</div>}
+            <div className="space-y-1.5">
+              <label className="text-[12px] font-bold text-zinc-400 ml-1">Title</label>
+              <input type="text" className="w-full h-10 bg-black rounded-lg px-3 text-[13px] text-white border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner" placeholder="e.g. Production credentials reminder" value={editNoteData.title} onChange={e => setEditNoteData({ ...editNoteData, title: e.target.value })} />
+            </div>
+            <div className="space-y-1.5 flex-1 flex flex-col min-h-[240px]">
+              <label className="text-[12px] font-bold text-zinc-400 ml-1">Content</label>
+              <textarea className="w-full flex-1 bg-black rounded-lg p-3 text-[13px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner custom-scrollbar resize-none leading-relaxed" placeholder="Write anything — markdown, paths, secrets you'd otherwise forget…" value={editNoteData.body} onChange={e => setEditNoteData({ ...editNoteData, body: e.target.value })} />
+            </div>
+          </div>
+          <div className="p-6 border-t border-white/5 shrink-0">
+            <button
+              onClick={async () => {
+                if (!editNoteData.title.trim() && !editNoteData.body.trim()) {
+                  setFormError("Add a title or some content first.");
+                  return;
+                }
+                try {
+                  const action = editNoteData.id
+                    ? invoke("edit_note", { id: editNoteData.id, title: editNoteData.title, body: editNoteData.body })
+                    : invoke("add_note", { title: editNoteData.title, body: editNoteData.body });
+                  await action;
+                  setIsNotePanelOpen(false);
+                  refreshNotes();
+                  addLog("Note saved.", "success");
+                } catch (e) {
+                  setFormError(`Failed to save note: ${e}`);
+                  addLog(`NOTE_SAVE_ERROR: ${e}`, "error");
+                }
+              }}
               className="w-full h-10 bg-primary text-black font-bold rounded-lg text-[13px] tracking-tight hover:bg-primary transition-all active:scale-[0.98] shadow-[0_0_15px_rgba(var(--primary),0.2)] flex items-center justify-center gap-2"
             >
               Save

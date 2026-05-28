@@ -1,10 +1,11 @@
-import { Server, KeyRound, TerminalSquare, Activity, List, Settings, LogOut } from "lucide-react";
+import { Server, KeyRound, TerminalSquare, StickyNote, Activity, List, Settings, LogOut } from "lucide-react";
 
 export const Sidebar = ({ activeTab, setActiveTab, isMobile, onLogout }: any) => {
   const items = [
     { id: 'nodes', icon: Server, label: 'Servers' },
     { id: 'vault', icon: KeyRound, label: 'Logins' },
     { id: 'commands', icon: TerminalSquare, label: 'Commands' },
+    { id: 'notes', icon: StickyNote, label: 'Notes' },
     { id: 'monitor', icon: Activity, label: 'Monitor' },
     { id: 'logs', icon: List, label: 'Activity' },
   ];

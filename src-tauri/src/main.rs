@@ -574,6 +574,14 @@ async fn setup_master_db(app_handle: tauri::AppHandle, mut password: String, sta
         let owned = to_sqlite_owned(&decrypted_data)?;
         conn.deserialize(DatabaseName::Main, owned, false)
             .map_err(|e| format!("[DATABASE] DESERIALIZE_FAILED: {}", e))?;
+        // Schema migration for vaults created before the Notes feature shipped.
+        // Existing tables are untouched; only the new ones get materialised.
+        // Idempotent — running it on a fresh vault that already has `notes`
+        // (from the schema batch below) is a no-op.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT)",
+            [],
+        ).map_err(|e| format!("[DATABASE] NOTES_MIGRATION_FAILED: {}", e))?;
     } else {
         let mut fresh = [0u8; SALT_LEN];
         rand::thread_rng().fill(&mut fresh);
@@ -599,6 +607,7 @@ async fn setup_master_db(app_handle: tauri::AppHandle, mut password: String, sta
              CREATE TABLE credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER, FOREIGN KEY(key_id) REFERENCES ssh_keys(id));
              CREATE TABLE servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT DEFAULT 'none', proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT DEFAULT 'vault', key_id INTEGER, FOREIGN KEY(folder_id) REFERENCES folders(id));
              CREATE TABLE commands (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT);
+             CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT);
              CREATE TABLE known_hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, port INTEGER, fingerprint TEXT);
              CREATE TABLE monitor_configs (node_id INTEGER PRIMARY KEY, enabled_metrics TEXT NOT NULL DEFAULT '[\"cpu\",\"mem\",\"disk\",\"load\"]', custom_metrics TEXT NOT NULL DEFAULT '[]', paused INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(node_id) REFERENCES servers(id) ON DELETE CASCADE);
              CREATE TABLE monitor_settings (id INTEGER PRIMARY KEY, json TEXT NOT NULL);"
@@ -1128,6 +1137,79 @@ async fn get_commands(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json
         }))
     }).map_err(|e| e.to_string())?;
     
+    let mut list = Vec::new();
+    for r in rows {
+        list.push(r.map_err(|e| format!("[DATABASE] ROW_FETCH_FAILED: {}", e))?);
+    }
+    Ok(list)
+}
+
+// ───────────────────────── Notes ─────────────────────────
+// Free-form text notes stored alongside the rest of the profile. Mirrors the
+// commands CRUD shape exactly — title + body, no FK, no timestamps. Search
+// is done client-side over the returned list so the user can match against
+// title and body in one go without us pushing a LIKE query through SQLite.
+
+#[tauri::command]
+async fn add_note(state: tauri::State<'_, DbState>, title: String, body: String) -> Result<(), String> {
+    let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+    let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+
+    conn.execute(
+        "INSERT INTO notes (title, body) VALUES (?1, ?2)",
+        rusqlite::params![title, body],
+    ).map_err(|e| format!("[DATABASE] NOTE_INSERT_FAILED: {}", e))?;
+
+    drop(conn_guard);
+    save_vault_internal(&state)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn edit_note(state: tauri::State<'_, DbState>, id: i32, title: String, body: String) -> Result<(), String> {
+    let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+    let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+
+    conn.execute(
+        "UPDATE notes SET title=?1, body=?2 WHERE id=?3",
+        rusqlite::params![title, body, id],
+    ).map_err(|e| format!("[DATABASE] NOTE_UPDATE_FAILED: {}", e))?;
+
+    drop(conn_guard);
+    save_vault_internal(&state)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_note(state: tauri::State<'_, DbState>, id: i32) -> Result<(), String> {
+    let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+    let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+
+    conn.execute(
+        "DELETE FROM notes WHERE id=?1",
+        rusqlite::params![id],
+    ).map_err(|e| format!("[DATABASE] NOTE_DELETE_FAILED: {}", e))?;
+
+    drop(conn_guard);
+    save_vault_internal(&state)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_notes(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
+    let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+    let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+    // Newest first — matches how users think about notes (last-touched up top).
+    let mut stmt = conn.prepare("SELECT id, title, body FROM notes ORDER BY id DESC").map_err(|e| e.to_string())?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok(json!({
+            "id": row.get::<_, i32>(0)?,
+            "title": row.get::<_, String>(1)?,
+            "body": row.get::<_, String>(2)?
+        }))
+    }).map_err(|e| e.to_string())?;
+
     let mut list = Vec::new();
     for r in rows {
         list.push(r.map_err(|e| format!("[DATABASE] ROW_FETCH_FAILED: {}", e))?);
@@ -3194,6 +3276,7 @@ fn main() {
             get_credentials, generate_ssh_key,
             add_folder, delete_folder, get_folders,
             add_command, edit_command, delete_command, get_commands,
+            add_note, edit_note, delete_note, get_notes,
             add_credential, edit_credential, delete_credential,
             add_ssh_key, edit_ssh_key, delete_ssh_key,
             initiate_connection, verify_fingerprint_response, disconnect_session,
