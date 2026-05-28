@@ -20,7 +20,19 @@ param(
     [string] $Source = (Resolve-Path (Join-Path $PSScriptRoot '..\app-icon.png')).Path,
     [string] $Output = (Join-Path $PSScriptRoot '..\app-icon-circular.png'),
     [int]    $AlphaThreshold = 16,   # pixels with alpha <= this are "background"
-    [int]    $Margin = 2              # breathing room around the cropped bbox
+    [int]    $Margin = 2,             # breathing room around the cropped bbox
+    # Final emit size. tauri icon will downscale from this to 16/32/48/256
+    # etc., and bicubic interpolation produces noticeably sharper small
+    # sizes when fed a 1024 source instead of the raw cropped bbox.
+    [int]    $TargetSize = 1024,
+    # A solid rounded backdrop that fills the canvas, so a landscape
+    # logo (like the submarine artwork) doesn't leave 40% empty space
+    # top + bottom in the taskbar slot. Pass -NoBackdrop to keep the
+    # original transparent-canvas behaviour.
+    [switch] $NoBackdrop,
+    [string] $BackdropColor = '#0E1116',  # near-black, matches the app shell
+    [double] $BackdropInsetPct = 0.02,    # 2% of canvas tucked in from each edge
+    [double] $BackdropRadiusPct = 0.22    # corner radius as fraction of canvas
 )
 
 Add-Type -AssemblyName System.Drawing
@@ -103,9 +115,53 @@ try {
         } finally {
             $g.Dispose()
         }
-        $dst.Save($Output, [System.Drawing.Imaging.ImageFormat]::Png)
+        # ----- Final composite: upscale to $TargetSize and (optionally)
+        #       lay a rounded backdrop under the logo so the canvas isn't
+        #       40% empty in the taskbar slot.
+        $final = New-Object System.Drawing.Bitmap $TargetSize, $TargetSize, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $gf = [System.Drawing.Graphics]::FromImage($final)
+        try {
+            $gf.SmoothingMode      = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $gf.InterpolationMode  = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $gf.PixelOffsetMode    = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+            $gf.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
+            $gf.Clear([System.Drawing.Color]::Transparent)
+
+            if (!$NoBackdrop) {
+                $inset = [int]([Math]::Round($TargetSize * $BackdropInsetPct))
+                $bgSize = $TargetSize - 2 * $inset
+                $bgR = [int]([Math]::Round($TargetSize * $BackdropRadiusPct))
+                $bgR = [Math]::Min($bgR, [int]($bgSize / 2))
+
+                $bgPath = New-Object System.Drawing.Drawing2D.GraphicsPath
+                # Build a rounded-square path manually: four arcs + closure.
+                $d = $bgR * 2
+                $bgPath.AddArc($inset,                   $inset,                   $d, $d, 180, 90) | Out-Null
+                $bgPath.AddArc($inset + $bgSize - $d,    $inset,                   $d, $d, 270, 90) | Out-Null
+                $bgPath.AddArc($inset + $bgSize - $d,    $inset + $bgSize - $d,    $d, $d, 0,   90) | Out-Null
+                $bgPath.AddArc($inset,                   $inset + $bgSize - $d,    $d, $d, 90,  90) | Out-Null
+                $bgPath.CloseFigure()
+
+                $bgCol = [System.Drawing.ColorTranslator]::FromHtml($BackdropColor)
+                $bgBrush = New-Object System.Drawing.SolidBrush $bgCol
+                $gf.FillPath($bgBrush, $bgPath)
+                $bgBrush.Dispose()
+                $bgPath.Dispose()
+            }
+
+            # Logo on top, centred, scaled to ~92% of the canvas so the
+            # backdrop's rounded corners stay visible around the artwork.
+            $logoFit = [int]([Math]::Round($TargetSize * 0.92))
+            $logoOff = [int](($TargetSize - $logoFit) / 2)
+            $gf.DrawImage($dst, $logoOff, $logoOff, $logoFit, $logoFit)
+        } finally {
+            $gf.Dispose()
+        }
+        $final.Save($Output, [System.Drawing.Imaging.ImageFormat]::Png)
+        $final.Dispose()
         $dst.Dispose()
-        Write-Output ("Cropped to content bbox: original {0}x{1} -> {2}x{2}  (visible {3}x{4})" -f $W, $H, $size, $bw, $bh)
+        $backdropNote = if ($NoBackdrop) { "no backdrop" } else { "backdrop $BackdropColor" }
+        Write-Output ("Cropped + composited: source {0}x{1} -> logo {2}x{2} -> output {3}x{3} ({4})" -f $W, $H, $size, $TargetSize, $backdropNote)
     } else {
         # ----- Fall back: source has solid corners, apply circular mask -----
         $size = [Math]::Max($W, $H)
