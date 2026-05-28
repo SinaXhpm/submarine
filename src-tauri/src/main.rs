@@ -3127,6 +3127,27 @@ async fn monitor_resume_all(
 }
 
 fn main() {
+    // Tauri 2 on Linux embeds webkit2gtk-4.1, whose default renderer path uses
+    // DMA-BUF + EGL — and that path crashes ("EGL_BAD_PARAMETER … Aborting",
+    // SIGABRT inside WebKitWebProcess) on Mesa ≥ 24 / WebKit ≥ 2.44 with a
+    // wide range of GPUs (intel, amdgpu, nvidia under Wayland, llvmpipe in
+    // VMs). The known-good workaround is to flip the renderer to the older
+    // GLES path before WebKit spawns its child process; once a child inherits
+    // a flipped env, every subsequent webview behaves. We also disable the
+    // separate compositing fast-path as belt-and-braces — costs nothing and
+    // covers the residual class of "EGL surface init failed" reports.
+    //
+    // Refs: WebKit bug #258834, Tauri issue tauri-apps/tauri#9304.
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+        if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        }
+    }
+
     tauri::Builder::default()
         .manage(DbState { conn: std::sync::Arc::new(StdMutex::new(None)), master_key: StdMutex::new(None), salt: StdMutex::new(None), db_path: StdMutex::new(None), active_profile: StdMutex::new(None) })
         .manage(SshState::new())
