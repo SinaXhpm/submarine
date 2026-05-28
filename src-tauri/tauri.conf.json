@@ -12,8 +12,8 @@
     "windows": [
       {
         "title": "Submarine",
-        "width": 1200,
-        "height": 780,
+        "width": 1080,
+        "height": 720,
         "minWidth": 820,
         "minHeight": 600,
         "decorations": false,
