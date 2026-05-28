@@ -358,7 +358,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               disabled={busy || !selected}
               className="w-full h-11 rounded-xl text-[14px] font-semibold bg-primary text-black hover:shadow-[0_0_24px_rgba(var(--primary),0.3)] disabled:opacity-50 flex items-center justify-center gap-2 transition-all"
             >
-              {busy ? "Opening…" : (<>Open <ArrowRight size={15} /></>)}
+              {busy ? (<><RefreshCw size={14} className="animate-spin" /> Deriving key…</>) : (<>Open <ArrowRight size={15} /></>)}
             </button>
 
             <div className="flex gap-2 pt-1">
