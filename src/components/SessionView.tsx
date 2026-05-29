@@ -9,8 +9,18 @@ import TunnelsPanel from "./TunnelsPanel";
 import { CmdsPanel } from "./CmdsPanel";
 import { useIsCompact } from "../hooks/useViewport";
 
-export const SessionView = ({ session, onClose, addLog }: any) => {
+export const SessionView = ({ session, onClose, addLog, onStatusChange }: any) => {
   const [status, setStatus] = useState<'connecting' | 'connected' | 'failed' | 'disconnected'>('connecting');
+
+  // Bubble every status change up to the parent so the session-tab strip
+  // can draw a coloured dot (green / amber / red) next to the name without
+  // having to mount its own listeners or duplicate the connection-event
+  // wiring we already do here.
+  useEffect(() => {
+    if (typeof onStatusChange === "function") {
+      onStatusChange(session?.id, status);
+    }
+  }, [status, session?.id, onStatusChange]);
   const [disconnectReason, setDisconnectReason] = useState<string>("");
   const [logs, setLogs] = useState<{ msg: string, type: string }[]>([]);
   const [fingerprintPrompt, setFingerprintPrompt] = useState<any>(null);

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import {
@@ -46,6 +46,14 @@ function DesktopApp() {
   const [activeProfile, setActiveProfile] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<string>("nodes");
   const [sessions, setSessions] = useState<Session[]>([]);
+  // Tracks the live status of each open session ('connecting' | 'connected'
+  // | 'failed' | 'disconnected'). Updated via the callback every SessionView
+  // fires on its own status change — single source of truth for the dot
+  // colour on each tab. Cleared when a session is closed.
+  const [sessionStatuses, setSessionStatuses] = useState<Record<string, string>>({});
+  const handleSessionStatus = useCallback((sessionId: string, status: string) => {
+    setSessionStatuses((prev) => (prev[sessionId] === status ? prev : { ...prev, [sessionId]: status }));
+  }, []);
   const [isPanelOpen, setIsPanelOpen] = useState(false);
   const [isQuickConnectOpen, setIsQuickConnectOpen] = useState(false);
   const [servers, setServers] = useState<any[]>([]);
@@ -74,7 +82,8 @@ function DesktopApp() {
     name: "", host: "", port: 22, username: "", password: "",
     authType: "vault", credentialId: "", folderId: "", keyId: "",
     proxyType: "none", proxyHost: "", proxyPort: 1080,
-    tunnels: [] as { local: string, remote: string, type: string }[]
+    tunnels: [] as { local: string, remote: string, type: string }[],
+    autostart: false,
   };
 
   // Live width-based "narrow viewport" flag. Replaces a one-shot UA check
@@ -204,11 +213,36 @@ function DesktopApp() {
   // flow on a single screen. By the time it fires `onUnlocked`, the
   // backend has both selected the profile AND decrypted the DB — we just
   // flip the UI and refresh data.
-  const handleProfileUnlocked = (name: string) => {
+  const handleProfileUnlocked = async (name: string) => {
     setActiveProfile(name);
     setIsUnlocked(true);
-    refreshAll();
     addLog(`Profile "${name}" unlocked.`, "success");
+    refreshAll();
+    // Autostart sweep: load servers directly (refreshAll is also doing this
+    // in parallel, but its state update is async and we can't read `servers`
+    // back here without a stale-closure race), pick the ones flagged
+    // autostart, and stage them all into the sessions tab strip in one
+    // setSessions call. The user lands focused on the first autostart node;
+    // each new SessionView component then kicks off its own connect on mount.
+    try {
+      const list = await invoke<any[]>("get_servers");
+      const toStart = list.filter((s) => s.autostart);
+      if (toStart.length === 0) return;
+      const newSessions = toStart.map((s) => ({
+        id: `session-${s.id}`,
+        serverId: s.id,
+        serverName: s.name,
+      }));
+      setSessions((prev: any[]) => {
+        const seen = new Set(prev.map((p) => p.id));
+        const fresh = newSessions.filter((n) => !seen.has(n.id));
+        return [...prev, ...fresh];
+      });
+      setActiveView(newSessions[0].id);
+      addLog(`Autostart: opened ${newSessions.length} node${newSessions.length === 1 ? "" : "s"}.`, "info");
+    } catch (e) {
+      addLog(`AUTOSTART_LOAD_FAILED: ${e}`, "error");
+    }
   };
 
   const confirm = useConfirm();
@@ -294,7 +328,8 @@ function DesktopApp() {
       proxyType: server.proxy_type || "none",
       proxyHost: server.proxy_host || "",
       proxyPort: server.proxy_port || 1080,
-      tunnels: server.tunnels ? JSON.parse(server.tunnels) : []
+      tunnels: server.tunnels ? JSON.parse(server.tunnels) : [],
+      autostart: !!server.autostart,
     });
     setIsPanelOpen(true);
   };
@@ -307,16 +342,51 @@ function DesktopApp() {
       </div>
       
       <div className="flex-1 flex gap-1 overflow-x-auto no-scrollbar h-full items-end pb-1" data-tauri-drag-region>
-        {sessions.map(s => (
-          <div
-            key={s.id}
-            onClick={() => setActiveView(s.id)}
-            className={`group no-drag flex items-center h-7 px-4 rounded-full cursor-pointer transition-all min-w-[100px] max-w-[180px] mr-1 ${activeView === s.id ? 'bg-primary/15 text-primary border border-primary/40 shadow-inner shadow-primary/10' : 'bg-white/[0.06] text-zinc-300 border border-white/10 hover:bg-white/[0.1] hover:border-white/20 hover:text-white'}`}
-          >
-            <span className="text-[10px] font-bold truncate flex-1 uppercase tracking-tight">{s.serverName}</span>
-            <X size={10} className="ml-2 opacity-0 group-hover:opacity-100 hover:text-red-500" onClick={(e) => { e.stopPropagation(); setSessions(prev => prev.filter(sess => sess.id !== s.id)); setActiveView(prev => (prev === s.id ? "nodes" : prev)); }} />
-          </div>
-        ))}
+        {sessions.map(s => {
+          const st = sessionStatuses[s.id] ?? "connecting";
+          // Dot palette: green = connected, amber = connecting, red = failed
+          // or disconnected. The pulse animation only runs while connecting
+          // so a steady-state tab doesn't draw the eye every half second.
+          const dotTone =
+            st === "connected"    ? "bg-emerald-400" :
+            st === "connecting"   ? "bg-amber-400 animate-pulse" :
+            st === "failed"       ? "bg-rose-500" :
+            st === "disconnected" ? "bg-rose-500" :
+                                    "bg-zinc-500";
+          const dotTitle =
+            st === "connected"    ? "Connected" :
+            st === "connecting"   ? "Connecting…" :
+            st === "failed"       ? "Connection failed" :
+            st === "disconnected" ? "Disconnected" :
+                                    st;
+          return (
+            <div
+              key={s.id}
+              onClick={() => setActiveView(s.id)}
+              className={`group no-drag flex items-center h-7 px-4 rounded-full cursor-pointer transition-all min-w-[100px] max-w-[180px] mr-1 ${activeView === s.id ? 'bg-primary/15 text-primary border border-primary/40 shadow-inner shadow-primary/10' : 'bg-white/[0.06] text-zinc-300 border border-white/10 hover:bg-white/[0.1] hover:border-white/20 hover:text-white'}`}
+            >
+              <span
+                title={dotTitle}
+                className={`w-2 h-2 rounded-full mr-2 shrink-0 ${dotTone}`}
+                aria-label={dotTitle}
+              />
+              <span className="text-[10px] font-bold truncate flex-1 uppercase tracking-tight">{s.serverName}</span>
+              <X
+                size={10}
+                className="ml-2 opacity-0 group-hover:opacity-100 hover:text-red-500"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSessions(prev => prev.filter(sess => sess.id !== s.id));
+                  setSessionStatuses(prev => {
+                    const { [s.id]: _, ...rest } = prev;
+                    return rest;
+                  });
+                  setActiveView(prev => (prev === s.id ? "nodes" : prev));
+                }}
+              />
+            </div>
+          );
+        })}
       </div>
       <div className="flex items-center h-full gap-1 no-drag">
         <button onClick={() => appWindow.minimize()} className="w-10 h-full flex items-center justify-center hover:bg-white/5 transition-colors"><div className="w-3.5 h-[1.5px] bg-zinc-600" /></button>
@@ -473,9 +543,14 @@ function DesktopApp() {
                     session={sess}
                     onClose={() => {
                       setSessions(prev => prev.filter(s => s.id !== sess.id));
+                      setSessionStatuses(prev => {
+                        const { [sess.id]: _, ...rest } = prev;
+                        return rest;
+                      });
                       setActiveView(prev => (prev === sess.id ? "nodes" : prev));
                     }}
                     addLog={addLog}
+                    onStatusChange={handleSessionStatus}
                   />
                 </ErrorBoundary>
               </div>
@@ -673,6 +748,7 @@ function DesktopApp() {
               tunnels: newNode.tunnels || [],
               authType: newNode.authType,
               keyId: newNode.authType === "custom_key" && newNode.keyId ? parseInt(newNode.keyId) : null,
+              autostart: !!newNode.autostart,
             };
             const action = newNode.id 
               ? invoke("edit_server", { id: newNode.id, ...payload }) 

@@ -249,6 +249,34 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                 ))}
               </div>
             </div>
+
+            {/* Autostart toggle — when on, the node opens a session and
+                connects automatically right after the user unlocks the
+                profile. Useful for the one or two servers you always have
+                a shell on. */}
+            <div className="flex items-center justify-between gap-3 pt-1">
+              <div className="min-w-0">
+                <div className="text-[11px] font-bold text-zinc-300">Autostart</div>
+                <div className="text-[10.5px] text-zinc-500 leading-snug">
+                  Open + connect this node automatically when the app launches.
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setNewNode({ ...newNode, autostart: !newNode.autostart })}
+                role="switch"
+                aria-checked={!!newNode.autostart}
+                className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${
+                  newNode.autostart ? "bg-primary" : "bg-white/10"
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 left-0.5 w-5 h-5 bg-zinc-100 rounded-full shadow transition-transform ${
+                    newNode.autostart ? "translate-x-5" : "translate-x-0"
+                  }`}
+                />
+              </button>
+            </div>
           </div>
         </div>
 

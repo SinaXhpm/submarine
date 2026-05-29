@@ -583,6 +583,18 @@ async fn setup_master_db(app_handle: tauri::AppHandle, mut password: String, sta
             "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT)",
             [],
         ).map_err(|e| format!("[DATABASE] NOTES_MIGRATION_FAILED: {}", e))?;
+        // Schema migration for the autostart-on-launch flag added later. We
+        // can't use `IF NOT EXISTS` on ALTER, so swallow the "duplicate
+        // column" error specifically — anything else propagates.
+        if let Err(e) = conn.execute(
+            "ALTER TABLE servers ADD COLUMN autostart INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
+            let s = e.to_string();
+            if !s.contains("duplicate column name") {
+                return Err(format!("[DATABASE] AUTOSTART_MIGRATION_FAILED: {}", s));
+            }
+        }
     } else {
         let mut fresh = [0u8; SALT_LEN];
         rand::thread_rng().fill(&mut fresh);
@@ -606,7 +618,7 @@ async fn setup_master_db(app_handle: tauri::AppHandle, mut password: String, sta
             "CREATE TABLE folders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, parent_id INTEGER);
              CREATE TABLE ssh_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, public_key TEXT, private_key TEXT, passphrase TEXT);
              CREATE TABLE credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER, FOREIGN KEY(key_id) REFERENCES ssh_keys(id));
-             CREATE TABLE servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT DEFAULT 'none', proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT DEFAULT 'vault', key_id INTEGER, FOREIGN KEY(folder_id) REFERENCES folders(id));
+             CREATE TABLE servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT DEFAULT 'none', proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT DEFAULT 'vault', key_id INTEGER, autostart INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(folder_id) REFERENCES folders(id));
              CREATE TABLE commands (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT);
              CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT);
              CREATE TABLE known_hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, port INTEGER, fingerprint TEXT);
@@ -854,7 +866,8 @@ async fn add_server(
     proxy_port: i32,
     tunnels: Vec<serde_json::Value>,
     auth_type: String,
-    key_id: Option<i32>
+    key_id: Option<i32>,
+    autostart: Option<bool>,
 ) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
@@ -869,9 +882,10 @@ async fn add_server(
         &auth_type, username, password, key_id, credential_id,
     );
 
+    let autostart_i: i32 = if autostart.unwrap_or(false) { 1 } else { 0 };
     let res = conn.execute(
-        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-        rusqlite::params![name, host, port, db_username, db_password, db_credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels_json, auth_type, db_key_id],
+        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        rusqlite::params![name, host, port, db_username, db_password, db_credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels_json, auth_type, db_key_id, autostart_i],
     ).map_err(|e| format!("[DATABASE] SERVER_INSERT_FAILED: SQL_ERROR={}", e))?;
 
     if res == 0 {
@@ -899,7 +913,8 @@ async fn edit_server(
     proxy_port: i32,
     tunnels: Vec<serde_json::Value>,
     auth_type: String,
-    key_id: Option<i32>
+    key_id: Option<i32>,
+    autostart: Option<bool>,
 ) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
@@ -910,9 +925,10 @@ async fn edit_server(
         &auth_type, username, password, key_id, credential_id,
     );
 
+    let autostart_i: i32 = if autostart.unwrap_or(false) { 1 } else { 0 };
     conn.execute(
-        "UPDATE servers SET name=?1, host=?2, port=?3, username=?4, password=?5, credential_id=?6, folder_id=?7, proxy_type=?8, proxy_host=?9, proxy_port=?10, tunnels=?11, auth_type=?12, key_id=?13 WHERE id=?14",
-        rusqlite::params![name, host, port, db_username, db_password, db_credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels_json, auth_type, db_key_id, id],
+        "UPDATE servers SET name=?1, host=?2, port=?3, username=?4, password=?5, credential_id=?6, folder_id=?7, proxy_type=?8, proxy_host=?9, proxy_port=?10, tunnels=?11, auth_type=?12, key_id=?13, autostart=?14 WHERE id=?15",
+        rusqlite::params![name, host, port, db_username, db_password, db_credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels_json, auth_type, db_key_id, autostart_i, id],
     ).map_err(|e| format!("[DATABASE] SERVER_UPDATE_FAILED: SQL_ERROR={}", e))?;
 
     drop(conn_guard);
@@ -937,9 +953,9 @@ async fn delete_server(state: tauri::State<'_, DbState>, id: i32) -> Result<(), 
 async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id FROM servers")
+    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart FROM servers")
         .map_err(|e| format!("[DATABASE] PREPARE_FAILED: {}", e))?;
-    
+
     let rows = stmt.query_map([], |row| {
         Ok(json!({
             "id": row.get::<_, i32>(0)?,
@@ -956,6 +972,7 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
             "tunnels": row.get::<_, Option<String>>(11)?.unwrap_or_else(|| "[]".to_string()),
             "auth_type": row.get::<_, Option<String>>(12)?.unwrap_or_else(|| "vault".to_string()),
             "key_id": row.get::<_, Option<i32>>(13)?,
+            "autostart": row.get::<_, i32>(14).unwrap_or(0) != 0,
         }))
     }).map_err(|e| format!("[DATABASE] QUERY_MAPPING_FAILED: {}", e))?;
 
