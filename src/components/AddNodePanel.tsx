@@ -250,6 +250,86 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
               </div>
             </div>
 
+            {/* Folder mirrors saved on this node — one-way local → remote
+                sync. Stored alongside tunnels so they roam with the vault.
+                Live management (start / stop / log) lives in the Mirror
+                panel inside an open session. */}
+            <div className="space-y-2.5">
+              <div className="flex justify-between items-center">
+                <span className="text-[11px] font-bold text-zinc-400">Folder mirrors</span>
+                <button
+                  type="button"
+                  onClick={() => setNewNode({
+                    ...newNode,
+                    mirrors: [...(newNode.mirrors || []), { local: "", remote: "", soft_delete: true, excludes: [] }],
+                  })}
+                  className="text-[11px] font-bold text-primary hover:text-primary transition-colors"
+                >+ Add</button>
+              </div>
+              <div className="space-y-2">
+                {(newNode.mirrors || []).map((m: any, idx: number) => (
+                  <div key={idx} className="p-2.5 bg-[#1a1a1e] rounded-lg border border-white/5 group space-y-1.5">
+                    <div className="flex items-center gap-2">
+                      <input
+                        className="flex-1 min-w-0 h-7 bg-black/40 rounded px-2 text-[11.5px] font-mono text-zinc-200 border border-white/10 outline-none focus:border-primary/50"
+                        placeholder="/local/path"
+                        value={m.local}
+                        onChange={(e) => {
+                          const next = [...newNode.mirrors];
+                          next[idx] = { ...next[idx], local: e.target.value };
+                          setNewNode({ ...newNode, mirrors: next });
+                        }}
+                      />
+                      <ArrowLeftRight size={10} className="text-zinc-700 shrink-0 mx-1" />
+                      <input
+                        className="flex-1 min-w-0 h-7 bg-black/40 rounded px-2 text-[11.5px] font-mono text-zinc-200 border border-white/10 outline-none focus:border-primary/50"
+                        placeholder="/remote/path"
+                        value={m.remote}
+                        onChange={(e) => {
+                          const next = [...newNode.mirrors];
+                          next[idx] = { ...next[idx], remote: e.target.value };
+                          setNewNode({ ...newNode, mirrors: next });
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setNewNode({ ...newNode, mirrors: newNode.mirrors.filter((_: any, i: number) => i !== idx) })}
+                        className="opacity-0 group-hover:opacity-100 w-6 h-6 flex items-center justify-center text-red-500 hover:bg-red-500/10 rounded transition-all shrink-0"
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-3 pl-1">
+                      <label className="flex items-center gap-1.5 text-[10.5px] text-zinc-400 select-none cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={m.soft_delete !== false}
+                          onChange={(e) => {
+                            const next = [...newNode.mirrors];
+                            next[idx] = { ...next[idx], soft_delete: e.target.checked };
+                            setNewNode({ ...newNode, mirrors: next });
+                          }}
+                          className="accent-primary"
+                        />
+                        <span>Soft delete</span>
+                      </label>
+                      <input
+                        className="flex-1 min-w-0 h-6 bg-transparent rounded px-1 text-[10.5px] font-mono text-zinc-400 placeholder:text-zinc-700 outline-none"
+                        placeholder="Excludes: .git, node_modules, *.swp"
+                        value={(m.excludes || []).join(", ")}
+                        onChange={(e) => {
+                          const parts = e.target.value.split(",").map((s) => s.trim()).filter(Boolean);
+                          const next = [...newNode.mirrors];
+                          next[idx] = { ...next[idx], excludes: parts };
+                          setNewNode({ ...newNode, mirrors: next });
+                        }}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
             {/* Autostart toggle — when on, the node opens a session and
                 connects automatically right after the user unlocks the
                 profile. Useful for the one or two servers you always have

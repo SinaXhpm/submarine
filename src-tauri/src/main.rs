@@ -18,8 +18,10 @@ mod tunnel;
 mod monitor;
 mod cloud;
 mod about;
+mod mirror;
 use ssh_manager::SshState;
 use monitor::{MonitorMap, SharedSettings};
+use mirror::MirrorMap;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
@@ -595,6 +597,16 @@ async fn setup_master_db(app_handle: tauri::AppHandle, mut password: String, sta
                 return Err(format!("[DATABASE] AUTOSTART_MIGRATION_FAILED: {}", s));
             }
         }
+        // Schema migration for the mirror-config column.
+        if let Err(e) = conn.execute(
+            "ALTER TABLE servers ADD COLUMN mirrors TEXT NOT NULL DEFAULT '[]'",
+            [],
+        ) {
+            let s = e.to_string();
+            if !s.contains("duplicate column name") {
+                return Err(format!("[DATABASE] MIRRORS_MIGRATION_FAILED: {}", s));
+            }
+        }
     } else {
         let mut fresh = [0u8; SALT_LEN];
         rand::thread_rng().fill(&mut fresh);
@@ -618,7 +630,7 @@ async fn setup_master_db(app_handle: tauri::AppHandle, mut password: String, sta
             "CREATE TABLE folders (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, parent_id INTEGER);
              CREATE TABLE ssh_keys (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, public_key TEXT, private_key TEXT, passphrase TEXT);
              CREATE TABLE credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, auth_type TEXT, username TEXT, password TEXT, key_id INTEGER, FOREIGN KEY(key_id) REFERENCES ssh_keys(id));
-             CREATE TABLE servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT DEFAULT 'none', proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT DEFAULT 'vault', key_id INTEGER, autostart INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(folder_id) REFERENCES folders(id));
+             CREATE TABLE servers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, host TEXT, port INTEGER, username TEXT, password TEXT, credential_id INTEGER, folder_id INTEGER, proxy_type TEXT DEFAULT 'none', proxy_host TEXT, proxy_port INTEGER, tunnels TEXT, auth_type TEXT DEFAULT 'vault', key_id INTEGER, autostart INTEGER NOT NULL DEFAULT 0, mirrors TEXT NOT NULL DEFAULT '[]', FOREIGN KEY(folder_id) REFERENCES folders(id));
              CREATE TABLE commands (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, content TEXT);
              CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT);
              CREATE TABLE known_hosts (id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT, port INTEGER, fingerprint TEXT);
@@ -868,11 +880,15 @@ async fn add_server(
     auth_type: String,
     key_id: Option<i32>,
     autostart: Option<bool>,
+    mirrors: Option<Vec<serde_json::Value>>,
 ) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
 
     let tunnels_json = serde_json::to_string(&tunnels).unwrap_or_else(|_| "[]".to_string());
+    let mirrors_json = mirrors.as_ref()
+        .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|| "[]".into());
 
     // Enforce the "one source of truth" rule at write time: in vault mode the
     // node row carries no identity at all; in custom_* mode the credential
@@ -884,8 +900,8 @@ async fn add_server(
 
     let autostart_i: i32 = if autostart.unwrap_or(false) { 1 } else { 0 };
     let res = conn.execute(
-        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        rusqlite::params![name, host, port, db_username, db_password, db_credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels_json, auth_type, db_key_id, autostart_i],
+        "INSERT INTO servers (name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        rusqlite::params![name, host, port, db_username, db_password, db_credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels_json, auth_type, db_key_id, autostart_i, mirrors_json],
     ).map_err(|e| format!("[DATABASE] SERVER_INSERT_FAILED: SQL_ERROR={}", e))?;
 
     if res == 0 {
@@ -915,11 +931,15 @@ async fn edit_server(
     auth_type: String,
     key_id: Option<i32>,
     autostart: Option<bool>,
+    mirrors: Option<Vec<serde_json::Value>>,
 ) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
 
     let tunnels_json = serde_json::to_string(&tunnels).unwrap_or_else(|_| "[]".to_string());
+    let mirrors_json = mirrors.as_ref()
+        .map(|m| serde_json::to_string(m).unwrap_or_else(|_| "[]".into()))
+        .unwrap_or_else(|| "[]".into());
 
     let (db_username, db_password, db_key_id, db_credential_id) = normalize_server_identity(
         &auth_type, username, password, key_id, credential_id,
@@ -927,8 +947,8 @@ async fn edit_server(
 
     let autostart_i: i32 = if autostart.unwrap_or(false) { 1 } else { 0 };
     conn.execute(
-        "UPDATE servers SET name=?1, host=?2, port=?3, username=?4, password=?5, credential_id=?6, folder_id=?7, proxy_type=?8, proxy_host=?9, proxy_port=?10, tunnels=?11, auth_type=?12, key_id=?13, autostart=?14 WHERE id=?15",
-        rusqlite::params![name, host, port, db_username, db_password, db_credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels_json, auth_type, db_key_id, autostart_i, id],
+        "UPDATE servers SET name=?1, host=?2, port=?3, username=?4, password=?5, credential_id=?6, folder_id=?7, proxy_type=?8, proxy_host=?9, proxy_port=?10, tunnels=?11, auth_type=?12, key_id=?13, autostart=?14, mirrors=?15 WHERE id=?16",
+        rusqlite::params![name, host, port, db_username, db_password, db_credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels_json, auth_type, db_key_id, autostart_i, mirrors_json, id],
     ).map_err(|e| format!("[DATABASE] SERVER_UPDATE_FAILED: SQL_ERROR={}", e))?;
 
     drop(conn_guard);
@@ -953,7 +973,7 @@ async fn delete_server(state: tauri::State<'_, DbState>, id: i32) -> Result<(), 
 async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json::Value>, String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart FROM servers")
+    let mut stmt = conn.prepare("SELECT id, name, host, port, username, password, credential_id, folder_id, proxy_type, proxy_host, proxy_port, tunnels, auth_type, key_id, autostart, mirrors FROM servers")
         .map_err(|e| format!("[DATABASE] PREPARE_FAILED: {}", e))?;
 
     let rows = stmt.query_map([], |row| {
@@ -973,6 +993,7 @@ async fn get_servers(state: tauri::State<'_, DbState>) -> Result<Vec<serde_json:
             "auth_type": row.get::<_, Option<String>>(12)?.unwrap_or_else(|| "vault".to_string()),
             "key_id": row.get::<_, Option<i32>>(13)?,
             "autostart": row.get::<_, i32>(14).unwrap_or(0) != 0,
+            "mirrors": row.get::<_, Option<String>>(15)?.unwrap_or_else(|| "[]".to_string()),
         }))
     }).map_err(|e| format!("[DATABASE] QUERY_MAPPING_FAILED: {}", e))?;
 
@@ -1964,13 +1985,75 @@ async fn list_tunnels(
     Ok(tunnel::list_tunnels(&state.tunnels, session_id.as_deref()).await)
 }
 
+// ----- Mirror commands -----------------------------------------------------
+
 #[tauri::command]
-async fn disconnect_session(state: tauri::State<'_, SshState>, session_id: String) -> Result<(), String> {
+async fn mirror_dry_run(
+    ssh: tauri::State<'_, SshState>,
+    session_id: String,
+    spec: mirror::MirrorSpec,
+) -> Result<mirror::DryRunReport, String> {
+    let handle = {
+        let conns = ssh.connections.lock().await;
+        conns.get(&session_id).cloned()
+            .ok_or_else(|| "Session not connected".to_string())?
+    };
+    mirror::dry_run(handle, spec).await
+}
+
+#[tauri::command]
+async fn start_mirror(
+    app: tauri::AppHandle,
+    ssh: tauri::State<'_, SshState>,
+    mirrors: tauri::State<'_, MirrorMap>,
+    session_id: String,
+    spec: mirror::MirrorSpec,
+) -> Result<String, String> {
+    let handle = {
+        let conns = ssh.connections.lock().await;
+        conns.get(&session_id).cloned()
+            .ok_or_else(|| "Session not connected".to_string())?
+    };
+    mirror::start(app, session_id, handle, Arc::clone(&mirrors), spec).await
+}
+
+#[tauri::command]
+async fn stop_mirror(
+    mirrors: tauri::State<'_, MirrorMap>,
+    mirror_id: String,
+) -> Result<(), String> {
+    mirror::stop(&mirrors, &mirror_id).await
+}
+
+#[tauri::command]
+async fn list_mirrors(
+    mirrors: tauri::State<'_, MirrorMap>,
+    session_id: Option<String>,
+) -> Result<Vec<mirror::MirrorStatus>, String> {
+    Ok(mirror::list(&mirrors, session_id.as_deref()).await)
+}
+
+/// Native OS folder picker. Used by MirrorsPanel to fill in `local`.
+#[tauri::command]
+async fn pick_local_directory() -> Result<Option<String>, String> {
+    let path = rfd::AsyncFileDialog::new().pick_folder().await;
+    Ok(path.map(|p| p.path().to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+async fn disconnect_session(
+    state: tauri::State<'_, SshState>,
+    mirrors: tauri::State<'_, MirrorMap>,
+    session_id: String,
+) -> Result<(), String> {
     // Stop all forwarders so their listener sockets are released before the
     // SSH handle is dropped (otherwise newly-incoming connections would just
     // bounce off a dead channel).
     tunnel::stop_all_for_session(&state.tunnels, &session_id).await;
     state.forwarded_targets.lock().await.remove(&session_id);
+    // Same idea for any mirror that's still running — its watcher would
+    // try to push uploads through a dead SSH handle otherwise.
+    mirror::stop_all_for_session(&mirrors, &session_id).await;
     // Drop SFTP first so the channel it holds is freed before we tear down the
     // underlying SSH handle.
     state.sftp_sessions.lock().await.remove(&session_id);
@@ -3378,6 +3461,11 @@ fn main() {
         // from SshState — monitors and interactive sessions own different SSH
         // handles per node and don't share lifecycle.
         .manage::<MonitorMap>(std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())))
+        // Mirror tasks live under their own root-managed map — keyed by mirror
+        // id, populated by `start_mirror`, drained by the spawned worker on
+        // exit. Session teardown calls `mirror::stop_all_for_session` to make
+        // sure no orphan watcher is left running after the SSH handle dies.
+        .manage::<MirrorMap>(std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())))
         // Global monitor settings live in one shared Arc<Mutex>. Pollers
         // read it at the start of every cycle so interval/threshold changes
         // are hot-applied without restarting any monitor.
@@ -3405,6 +3493,7 @@ fn main() {
             add_folder, rename_folder, delete_folder, get_folders,
             add_command, edit_command, delete_command, get_commands,
             add_note, edit_note, delete_note, get_notes,
+            mirror_dry_run, start_mirror, stop_mirror, list_mirrors, pick_local_directory,
             add_credential, edit_credential, delete_credential,
             add_ssh_key, edit_ssh_key, delete_ssh_key,
             initiate_connection, verify_fingerprint_response, disconnect_session,

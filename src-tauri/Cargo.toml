@@ -79,6 +79,13 @@ russh-sftp = "2.1.2"
 rfd = "0.14"
 open = "5.1"
 notify = "6.1.1"
+# Debounces filesystem events so we don't try to upload a file mid-write.
+# Mirror watcher uses this — events for the same path within 500ms collapse
+# to a single action, which both eliminates partial uploads and keeps
+# rapid-fire editor saves (e.g. vim's swap-then-rename pattern) from
+# generating spurious traffic. Pairs cleanly with the `notify` 6.x crate
+# we already use elsewhere.
+notify-debouncer-mini = "0.4"
 regex = "1.10"
 # rustls-tls so we don't drag in OpenSSL on Windows builds. multipart for blob
 # uploads; json for typed request/response bodies.

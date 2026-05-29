@@ -2,10 +2,11 @@ import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
-import { TerminalSquare, Folder, Network, AlertTriangle, Check, X, ShieldAlert, Play, Terminal } from "lucide-react";
+import { TerminalSquare, Folder, Network, AlertTriangle, Check, X, ShieldAlert, Play, Terminal, FolderUp } from "lucide-react";
 import TerminalView from "./TerminalView";
 import SftpWorkspace from "./SftpWorkspace";
 import TunnelsPanel from "./TunnelsPanel";
+import MirrorsPanel from "./MirrorsPanel";
 import { CmdsPanel } from "./CmdsPanel";
 import { useIsCompact } from "../hooks/useViewport";
 
@@ -43,7 +44,7 @@ export const SessionView = ({ session, onClose, addLog, onStatusChange }: any) =
   });
 
   const [activeTab, setActiveTab] = useState<string>(`${session.id}-term-0`);
-  const [activeTool, setActiveTool] = useState<'sftp' | 'tunnels' | 'cmds' | null>(null);
+  const [activeTool, setActiveTool] = useState<'sftp' | 'tunnels' | 'mirrors' | 'cmds' | null>(null);
   // On narrow viewports the side-by-side terminal+tool layout doesn't fit.
   // We collapse to a stacked single-pane view: when a tool is open, the
   // tool takes full width and the terminal is hidden behind a back-chip.
@@ -490,7 +491,13 @@ export const SessionView = ({ session, onClose, addLog, onStatusChange }: any) =
           >
             <Network size={14} /> Ports
           </button>
-          <button 
+          <button
+            onClick={() => setActiveTool(activeTool === 'mirrors' ? null : 'mirrors')}
+            className={`h-8 px-4 rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${activeTool === 'mirrors' ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner' : 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'}`}
+          >
+            <FolderUp size={14} /> Mirror
+          </button>
+          <button
             onClick={() => setActiveTool(activeTool === 'cmds' ? null : 'cmds')}
             className={`h-8 px-4 rounded-lg flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider transition-all ${activeTool === 'cmds' ? 'bg-primary/10 text-primary border border-primary/20 shadow-inner' : 'text-zinc-300 bg-white/[0.04] border border-white/10 hover:bg-white/[0.08] hover:border-white/20 hover:text-white'}`}
           >
@@ -611,6 +618,26 @@ export const SessionView = ({ session, onClose, addLog, onStatusChange }: any) =
                 </div>
                 <div className="flex-1 overflow-hidden relative">
                   <TunnelsPanel sessionId={session.id} disabled={status !== 'connected'} />
+                </div>
+              </div>
+            )}
+
+            {activeTool === 'mirrors' && (
+              <div className="flex-1 flex flex-col overflow-hidden">
+                <div className="h-10 px-4 flex items-center justify-between border-b border-white/5 bg-white/5">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-400">Folder mirror</span>
+                  <button onClick={() => setActiveTool(null)} className="text-zinc-500 hover:text-white transition-colors">
+                    <X size={14} />
+                  </button>
+                </div>
+                <div className="flex-1 overflow-hidden relative">
+                  <MirrorsPanel
+                    sessionId={session.id}
+                    configuredMirrors={(() => {
+                      try { return JSON.parse(session.mirrors || "[]"); } catch { return []; }
+                    })()}
+                    disabled={status !== 'connected'}
+                  />
                 </div>
               </div>
             )}

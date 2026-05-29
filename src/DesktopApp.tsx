@@ -84,6 +84,7 @@ function DesktopApp() {
     proxyType: "none", proxyHost: "", proxyPort: 1080,
     tunnels: [] as { local: string, remote: string, type: string }[],
     autostart: false,
+    mirrors: [] as { local: string, remote: string, soft_delete: boolean, excludes: string[] }[],
   };
 
   // Live width-based "narrow viewport" flag. Replaces a one-shot UA check
@@ -243,6 +244,7 @@ function DesktopApp() {
         id: `session-${s.id}`,
         serverId: s.id,
         serverName: s.name,
+        mirrors: s.mirrors,
       }));
       setSessions((prev: any[]) => {
         const seen = new Set(prev.map((p) => p.id));
@@ -299,7 +301,11 @@ function DesktopApp() {
       setSessions([...sessions, {
         id: sessionId,
         serverId: server.id,
-        serverName: server.name
+        serverName: server.name,
+        // Pass the raw mirrors JSON through to SessionView so the
+        // MirrorsPanel can pre-populate "Saved on this node" without
+        // another round-trip to the backend.
+        mirrors: server.mirrors,
       }]);
     }
 
@@ -341,6 +347,9 @@ function DesktopApp() {
       proxyPort: server.proxy_port || 1080,
       tunnels: server.tunnels ? JSON.parse(server.tunnels) : [],
       autostart: !!server.autostart,
+      mirrors: (() => {
+        try { return JSON.parse(server.mirrors || "[]"); } catch { return []; }
+      })(),
     });
     setIsPanelOpen(true);
   };
@@ -771,6 +780,7 @@ function DesktopApp() {
               authType: newNode.authType,
               keyId: newNode.authType === "custom_key" && newNode.keyId ? parseInt(newNode.keyId) : null,
               autostart: !!newNode.autostart,
+              mirrors: newNode.mirrors || [],
             };
             const action = newNode.id 
               ? invoke("edit_server", { id: newNode.id, ...payload }) 
