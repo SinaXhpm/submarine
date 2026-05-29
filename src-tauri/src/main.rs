@@ -3305,12 +3305,24 @@ fn main() {
         if std::env::var_os("WEBKIT_DISABLE_HARDWARE_ACCELERATION").is_none() {
             std::env::set_var("WEBKIT_DISABLE_HARDWARE_ACCELERATION", "1");
         }
-        // bwrap sandbox sometimes prevents the inherited env from propagating
-        // to the WebKitWebProcess child on certain distros (Fedora's selinux-
-        // confined bwrap is the canonical offender). Disable it so the env
-        // flags above are visible inside the render process too. We lose the
-        // sandbox boundary for the webview, which is acceptable for a desktop
-        // app that already runs with full filesystem access.
+        // bwrap sandbox strips inherited env from WebKitWebProcess (Fedora's
+        // SELinux-confined bwrap is the canonical offender) — the flags we
+        // set in this block need to reach the render-process child or none
+        // of the rendering overrides will fire.
+        //
+        // WebKit 2.42 renamed `WEBKIT_FORCE_SANDBOX=0` to
+        // `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1` and the old name now
+        // emits a warning ("no longer allows disabling the sandbox") instead
+        // of actually disabling anything. We set BOTH so the override works
+        // across the full WebKit version range we'll meet in the wild —
+        // older WebKit picks up the legacy name, 2.42+ picks up the loud
+        // one. Losing the sandbox boundary for the webview is acceptable
+        // for a desktop app that already runs with the user's full
+        // filesystem access; the security boundary that matters
+        // (Tauri capabilities + strict CSP) is unaffected.
+        if std::env::var_os("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "1");
+        }
         if std::env::var_os("WEBKIT_FORCE_SANDBOX").is_none() {
             std::env::set_var("WEBKIT_FORCE_SANDBOX", "0");
         }
