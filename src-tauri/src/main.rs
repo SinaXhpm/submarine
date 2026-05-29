@@ -3278,6 +3278,29 @@ fn main() {
     // the variable themselves before launching.
     #[cfg(target_os = "linux")]
     {
+        // The single most effective override for the EGL_BAD_PARAMETER abort
+        // seen on Fedora 40+ / Mesa 24+: tell WebKit not to attempt hardware
+        // accelerated rendering AT ALL. The flag short-circuits the WebKit
+        // codepath that calls eglGetDisplay(), which is the exact line that
+        // SIGABRTs when the bundled libwayland-egl can't negotiate with the
+        // host Mesa. Set before any of the more granular flags so it wins
+        // on builds of WebKit that ignore the renderer-specific switches.
+        if std::env::var_os("WEBKIT_DISABLE_HARDWARE_ACCELERATION").is_none() {
+            std::env::set_var("WEBKIT_DISABLE_HARDWARE_ACCELERATION", "1");
+        }
+        // bwrap sandbox sometimes prevents the inherited env from propagating
+        // to the WebKitWebProcess child on certain distros (Fedora's selinux-
+        // confined bwrap is the canonical offender). Disable it so the env
+        // flags above are visible inside the render process too. We lose the
+        // sandbox boundary for the webview, which is acceptable for a desktop
+        // app that already runs with full filesystem access.
+        if std::env::var_os("WEBKIT_FORCE_SANDBOX").is_none() {
+            std::env::set_var("WEBKIT_FORCE_SANDBOX", "0");
+        }
+        // Older-renderer + DMA-BUF flags stay as belt-and-braces — they
+        // cost nothing on builds where WEBKIT_DISABLE_HARDWARE_ACCELERATION
+        // already wins, and they cover the corner cases where a downstream
+        // patched WebKit honours one but not the other.
         if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
             std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
         }
@@ -3287,15 +3310,8 @@ fn main() {
         if std::env::var_os("GDK_BACKEND").is_none() {
             std::env::set_var("GDK_BACKEND", "x11");
         }
-        // Last-resort belt-and-braces for the EGL_BAD_PARAMETER SIGABRT seen
-        // on Fedora 40+ / Mesa 24+ even with the renderer flags above. Forces
-        // Mesa to use the llvmpipe software rasteriser instead of trying to
-        // pick a hardware EGL backend. For a Tauri webview rendering plain
-        // HTML/CSS the visual difference is negligible — no 3D, no shaders,
-        // no compositor effects we depend on — and modern CPUs handle it at
-        // 60 fps without breaking a sweat. The cost is paid for by the app
-        // actually launching on systems where the bundled libwayland-egl
-        // can't negotiate a display with the host Mesa.
+        // Mesa software rasteriser flag kept as the final fallback in case
+        // WebKit's "no hardware" path still calls into Mesa somewhere.
         if std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
             std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
         }
