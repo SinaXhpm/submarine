@@ -238,6 +238,9 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
             className="w-28 h-28 mb-4 drop-shadow-[0_0_32px_rgba(var(--primary),0.22)]"
           />
           <h1 className="text-[22px] font-semibold text-white tracking-tight leading-none">Submarine</h1>
+          <p className="text-[10px] text-primary/80 mt-1.5 tracking-[0.22em] uppercase font-semibold">
+            Run Silent, Run Deep
+          </p>
           <p className="text-[12.5px] text-zinc-500 mt-2">
             {loading
               ? " "
