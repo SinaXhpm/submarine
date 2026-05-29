@@ -711,11 +711,27 @@ async fn generate_ssh_key(state: tauri::State<'_, DbState>, name: String) -> Res
 /// user enters the key rather than when they try to connect.
 fn validate_ssh_private_key(private_key: &str) -> Result<(), String> {
     let trimmed = private_key.trim();
-    if trimmed.starts_with("-----BEGIN RSA PRIVATE KEY-----")
-        || trimmed.starts_with("-----BEGIN DSA PRIVATE KEY-----")
+
+    // PKCS#1 / PKCS#8 / SEC1 PEM headers. Whether we accept these depends on
+    // whether the build has russh's OpenSSL backend wired in — see the
+    // matching gate in the connect path.
+    if trimmed.starts_with("-----BEGIN RSA PRIVATE KEY-----") {
+        #[cfg(feature = "full-ssh-algos")]
+        {
+            return Ok(());
+        }
+        #[cfg(not(feature = "full-ssh-algos"))]
+        {
+            return Err("[SSH] UNSUPPORTED_KEY_FORMAT_DEV: RSA keys aren't available in this debug build. Either build with --features full-ssh-algos (requires Perl) or install a release build from GitHub — both support RSA. Ed25519 keys work everywhere.".into());
+        }
+    }
+    if trimmed.starts_with("-----BEGIN DSA PRIVATE KEY-----")
         || trimmed.starts_with("-----BEGIN EC PRIVATE KEY-----")
     {
-        return Err("[SSH] UNSUPPORTED_KEY_FORMAT: Only OpenSSH-format Ed25519 keys are supported. Convert with: ssh-keygen -p -m RFC4716 -f <file>, or generate a new Ed25519 key.".into());
+        // DSA is dead; ECDSA in PEM (SEC1) needs an extra conversion russh
+        // doesn't do for us. Tell the user to convert and retry rather than
+        // pretending the format is fine.
+        return Err("[SSH] UNSUPPORTED_KEY_FORMAT: DSA / SEC1 ECDSA PEM keys aren't supported. Convert to OpenSSH format with `ssh-keygen -p -m PEM -f <file>` and re-import, or generate a fresh Ed25519 key.".into());
     }
 
     if trimmed.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----") {
@@ -724,9 +740,18 @@ fn validate_ssh_private_key(private_key: &str) -> Result<(), String> {
         if let Ok(parsed) = ssh_key::PrivateKey::from_openssh(trimmed) {
             match parsed.algorithm() {
                 ssh_key::Algorithm::Ed25519 => {}
+                ssh_key::Algorithm::Rsa { .. } | ssh_key::Algorithm::Ecdsa { .. } => {
+                    #[cfg(not(feature = "full-ssh-algos"))]
+                    {
+                        return Err(format!(
+                            "[SSH] UNSUPPORTED_KEY_TYPE_DEV: {} keys need a release build (or local build with --features full-ssh-algos). Ed25519 works everywhere.",
+                            parsed.algorithm().as_str()
+                        ));
+                    }
+                }
                 other => {
                     return Err(format!(
-                        "[SSH] UNSUPPORTED_KEY_TYPE: {} keys are not supported. Use Ed25519.",
+                        "[SSH] UNSUPPORTED_KEY_TYPE: {} keys are not supported.",
                         other.as_str()
                     ));
                 }
@@ -737,7 +762,7 @@ fn validate_ssh_private_key(private_key: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    Err("[SSH] UNRECOGNIZED_KEY_FORMAT: Expected an OpenSSH-format private key (begins with -----BEGIN OPENSSH PRIVATE KEY-----).".into())
+    Err("[SSH] UNRECOGNIZED_KEY_FORMAT: Expected an OpenSSH-format private key (begins with -----BEGIN OPENSSH PRIVATE KEY-----) or RSA PEM.".into())
 }
 
 #[tauri::command]
