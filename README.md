@@ -31,12 +31,29 @@ Submarine is a fast, local-first SSH/SFTP client with optional end-to-end encryp
 
 ## Security
 
-- Master password derives a vault key via **Argon2id** (m=64MiB, t=3, p=4)
-- Profiles vault is **AES-256-GCM**, compressed with zstd before encryption
-- Sync blobs are encrypted **client-side end-to-end** — we only host the ciphertext; the master key never leaves your device, so we cannot read your data even if we wanted to
-- Master key is held in `zeroize`'d memory and wiped on lock
-- Strict CSP, minimal Tauri capability ACL, no shell/fs plugins exposed
-- Host keys pinned per-host with a per-connection nonce binding to prevent prompt-races
+Everything is encrypted on your machine before it leaves it. Neither Submarine nor the sync server ever sees your passwords, private keys, or any profile content.
+
+**How it works, end to end:**
+
+1. **Master password → vault key** (on your device).
+   When you unlock, your password runs through **Argon2id** (m=64 MiB, t=3, p=4) to derive a vault key. The password is wiped from memory the moment derivation finishes; it never goes anywhere else.
+2. **Profiles → encrypted vault** (on your device).
+   Every saved profile — credentials, private keys, tunnels, notes, mirrors — is serialised, compressed with zstd, then sealed with **AES-256-GCM** using that vault key. What lands on disk is an opaque ciphertext.
+3. **Vault → cloud sync** (end-to-end).
+   When you turn sync on, the bytes we upload are that exact same encrypted blob. The server stores ciphertext + a random nonce + a version stamp. That's it.
+
+**Why the sync backend can't read your profiles:**
+
+- The vault key is derived **only on your device**, from a password we never receive — no register-with-password, no recovery email, no "forgot password" link, nothing the server could derive a key from.
+- The blob is encrypted **before** the upload call. By the time the bytes hit the network they're already AES-256-GCM ciphertext with no key material attached.
+- Argon2id's cost (64 MiB / 3 passes / 4 lanes) makes brute-forcing the master password from a leaked ciphertext infeasible.
+- Worst case — full server compromise — an attacker gets the same opaque blob you'd see if you uploaded a random file to S3. Same threat model.
+
+**Other defences:**
+
+- Master key lives in `zeroize`-wrapped memory and is wiped on lock.
+- TOFU host keys, pinned per-host with a per-connection nonce binding (prevents prompt-races).
+- Strict CSP, minimal Tauri capability ACL, no shell/fs plugins exposed to the UI.
 
 ## Install
 
