@@ -627,7 +627,7 @@ async fn run_dynamic_forward(
                             emit_log(&app, &session_id, &tunnel_id, "info", "stop",
                                      None, Some(peer.to_string()), Some("Tunnel stopped".into()));
                         }
-                        res = handle_socks(handle, sock, peer, app.clone(), session_id.clone(), tunnel_id.clone()) => {
+                        res = handle_dynamic_client(handle, sock, peer, app.clone(), session_id.clone(), tunnel_id.clone()) => {
                             if let Err(e) = res {
                                 emit_log(&app, &session_id, &tunnel_id, "error", "fail",
                                          None, Some(peer.to_string()), Some(e));
@@ -736,12 +736,21 @@ pub async fn bridge_forwarded_channel(
     }
 }
 
-/// Sniff the first byte of the client greeting to figure out which SOCKS
-/// version the client speaks, then hand off to the version-specific handler.
-/// Supports SOCKS4 + SOCKS4a + SOCKS5 (which inherently covers SOCKS5h since
-/// the protocol field already carries hostnames). Anything else gets a clean
-/// rejection and a log line.
-async fn handle_socks(
+/// Detect the protocol the client is speaking from its first byte and hand
+/// off to the matching handler. The dynamic forward accepts:
+///
+///   * SOCKS5 / SOCKS5h (0x05) — domain mode covers hostname-resolving
+///     clients, no separate version on the wire.
+///   * SOCKS4 / SOCKS4a (0x04)
+///   * HTTP CONNECT (covers all HTTPS tunneling, plus any client that
+///     speaks the older RFC 2616 absolute-URI proxy form for plain HTTP).
+///     Triggered by ANY ASCII uppercase letter — the only legitimate first
+///     byte of an HTTP request method.
+///
+/// Anything else (control bytes, unknown SOCKS versions) gets a clean log
+/// line and the connection closes; we don't try to autodetect TLS or other
+/// raw bytes because there's no useful action we could take with them.
+async fn handle_dynamic_client(
     handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
     mut sock: tokio::net::TcpStream,
     peer: SocketAddr,
@@ -754,8 +763,312 @@ async fn handle_socks(
     match ver[0] {
         0x05 => handle_socks5(handle, sock, peer, app, session_id, tunnel_id).await,
         0x04 => handle_socks4(handle, sock, peer, app, session_id, tunnel_id).await,
-        v => Err(format!("Unknown SOCKS version 0x{:02x}", v)),
+        b if b.is_ascii_uppercase() => {
+            handle_http_proxy(handle, sock, peer, b, app, session_id, tunnel_id).await
+        }
+        v => Err(format!("Unknown protocol version 0x{:02x}", v)),
     }
+}
+
+/// HTTP proxy handler covering both CONNECT (the modern way — tunnels
+/// arbitrary TCP, used by every browser for HTTPS) and the older absolute-
+/// URI form (`GET http://host/path HTTP/1.1`) for plain HTTP. The first
+/// byte of the method was already consumed by the dispatcher and is passed
+/// in so we can stitch it back when reading the request line.
+async fn handle_http_proxy(
+    handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
+    mut sock: tokio::net::TcpStream,
+    peer: SocketAddr,
+    first_byte: u8,
+    app: AppHandle,
+    session_id: String,
+    tunnel_id: String,
+) -> Result<(), String> {
+    // Reconstruct the request line: dispatcher ate one byte, read the rest.
+    let mut rest = read_line_max(&mut sock, 8192).await
+        .map_err(|e| format!("http read req-line: {}", e))?;
+    let mut line = Vec::with_capacity(rest.len() + 1);
+    line.push(first_byte);
+    line.append(&mut rest);
+    let request_line = String::from_utf8_lossy(&line).into_owned();
+
+    let parts: Vec<&str> = request_line.splitn(3, ' ').collect();
+    if parts.len() < 2 {
+        let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+        return Err(format!("http: malformed request line {:?}", request_line));
+    }
+    let method = parts[0].to_string();
+    let uri = parts[1].to_string();
+
+    if method == "CONNECT" {
+        // `CONNECT host:port HTTP/1.1` — consume headers, open tunnel, reply 200.
+        consume_headers(&mut sock, 16 * 1024).await
+            .map_err(|e| format!("http connect headers: {}", e))?;
+        let (host, port) = parse_host_port(&uri)
+            .ok_or_else(|| format!("http connect: bad target {:?}", uri))?;
+
+        let target_full = format!("{}:{}", host, port);
+        emit_log(&app, &session_id, &tunnel_id, "info", "connect",
+                 Some(target_full.clone()), Some(peer.to_string()),
+                 Some("via HTTP CONNECT".into()));
+
+        let channel = {
+            let h = handle.lock().await;
+            h.channel_open_direct_tcpip(host.clone(), port as u32,
+                                         peer.ip().to_string(), peer.port() as u32).await
+        };
+        let channel = match channel {
+            Ok(c) => {
+                sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .map_err(|e| format!("http connect reply: {}", e))?;
+                c
+            }
+            Err(e) => {
+                let _ = sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                emit_log(&app, &session_id, &tunnel_id, "error", "fail",
+                         Some(target_full), Some(peer.to_string()), Some(e.to_string()));
+                return Err(format!("direct-tcpip {}:{} failed: {}", host, port, e));
+            }
+        };
+
+        let mut stream = channel.into_stream();
+        let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+        emit_log(&app, &session_id, &tunnel_id, "info", "close",
+                 Some(target_full), Some(peer.to_string()), None);
+        return Ok(());
+    }
+
+    // Plain HTTP — clients send the absolute URI (`GET http://host/path`)
+    // so the proxy can pick the destination. Bare-path requests (`GET /foo`)
+    // mean the client thinks we're the origin server, which we aren't.
+    let (host, port, path) = match parse_absolute_uri(&uri) {
+        Some(t) => t,
+        None => {
+            let _ = sock.write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n\
+                  Submarine HTTP proxy expects an absolute-URI request line \
+                  (e.g. `GET http://example.com/path HTTP/1.1`).\n"
+            ).await;
+            return Err(format!("http: unsupported URI form {:?}", uri));
+        }
+    };
+    let target_full = format!("{}:{}", host, port);
+    emit_log(&app, &session_id, &tunnel_id, "info", "connect",
+             Some(target_full.clone()), Some(peer.to_string()),
+             Some(format!("via HTTP {} {}", method, path)));
+
+    // Buffer the client headers so we can filter out the hop-by-hop /
+    // proxy-only ones before forwarding. We also force Connection: close
+    // upstream so we don't have to demultiplex a keep-alive pipeline back
+    // to multiple destinations on the same socket.
+    let headers_raw = read_headers_raw(&mut sock, 64 * 1024).await
+        .map_err(|e| format!("http headers: {}", e))?;
+    let forwarded_headers = filter_and_rewrite_headers(&headers_raw);
+
+    let channel = {
+        let h = handle.lock().await;
+        h.channel_open_direct_tcpip(host.clone(), port as u32,
+                                     peer.ip().to_string(), peer.port() as u32).await
+    };
+    let mut stream = match channel {
+        Ok(c) => c.into_stream(),
+        Err(e) => {
+            let _ = sock.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n").await;
+            emit_log(&app, &session_id, &tunnel_id, "error", "fail",
+                     Some(target_full), Some(peer.to_string()), Some(e.to_string()));
+            return Err(format!("direct-tcpip {}:{} failed: {}", host, port, e));
+        }
+    };
+
+    // Send rewritten request to upstream: relative URI, filtered headers, blank line.
+    let req_line = format!("{} {} HTTP/1.1\r\n", method, path);
+    if let Err(e) = stream.write_all(req_line.as_bytes()).await {
+        return Err(format!("http upstream write req-line: {}", e));
+    }
+    if let Err(e) = stream.write_all(&forwarded_headers).await {
+        return Err(format!("http upstream write headers: {}", e));
+    }
+    if let Err(e) = stream.write_all(b"\r\n").await {
+        return Err(format!("http upstream write blank: {}", e));
+    }
+
+    // Bridge body (request → upstream) and response (upstream → client) in
+    // both directions until either side finishes. Connection: close on the
+    // forwarded request makes the upstream close its half after one
+    // response, which cascades to closing the client socket — exactly what
+    // a non-pipelined HTTP proxy should do.
+    let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+    emit_log(&app, &session_id, &tunnel_id, "info", "close",
+             Some(target_full), Some(peer.to_string()), None);
+    Ok(())
+}
+
+// ----- HTTP helpers ---------------------------------------------------------
+
+/// Read bytes until a CRLF terminator (the line itself is returned without
+/// the CRLF). Capped at `max` bytes to refuse a malicious client streaming
+/// indefinitely.
+async fn read_line_max(sock: &mut tokio::net::TcpStream, max: usize) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(128);
+    let mut b = [0u8; 1];
+    let mut last_was_cr = false;
+    loop {
+        sock.read_exact(&mut b).await?;
+        if b[0] == b'\n' && last_was_cr {
+            out.pop(); // drop the trailing CR
+            return Ok(out);
+        }
+        last_was_cr = b[0] == b'\r';
+        out.push(b[0]);
+        if out.len() > max {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "http line too long"));
+        }
+    }
+}
+
+/// Consume header block (lines until an empty line). Total bytes capped at
+/// `max`. Used by the CONNECT path where we don't need to parse, just skip
+/// past the headers.
+async fn consume_headers(sock: &mut tokio::net::TcpStream, max: usize) -> std::io::Result<()> {
+    let mut total = 0usize;
+    loop {
+        let line = read_line_max(sock, max).await?;
+        total = total.saturating_add(line.len() + 2);
+        if line.is_empty() {
+            return Ok(());
+        }
+        if total > max {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "http headers too long"));
+        }
+    }
+}
+
+/// Read headers and return the raw bytes (each header line followed by
+/// CRLF; terminator blank line is NOT included so the caller can substitute
+/// its own rewritten header set + blank line).
+async fn read_headers_raw(sock: &mut tokio::net::TcpStream, max: usize) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(512);
+    loop {
+        let line = read_line_max(sock, max).await?;
+        if line.is_empty() {
+            return Ok(out);
+        }
+        if out.len() + line.len() + 2 > max {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "http headers too long"));
+        }
+        out.extend_from_slice(&line);
+        out.extend_from_slice(b"\r\n");
+    }
+}
+
+/// Drop hop-by-hop and proxy-specific headers, and force Connection: close
+/// on the forwarded request so the upstream tears down after one response
+/// (saves us from having to demultiplex a keep-alive pipeline across
+/// multiple destinations on the same client socket).
+fn filter_and_rewrite_headers(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut saw_connection = false;
+    for line in raw.split(|&b| b == b'\n') {
+        let mut line = line;
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
+        }
+        if line.is_empty() { continue; }
+        let lower = match std::str::from_utf8(line) {
+            Ok(s) => s.to_ascii_lowercase(),
+            Err(_) => continue, // skip non-utf8 garbage rather than relay it
+        };
+        // Hop-by-hop headers per RFC 7230 §6.1 + the proxy-* family.
+        if lower.starts_with("proxy-connection:")
+            || lower.starts_with("proxy-authenticate:")
+            || lower.starts_with("proxy-authorization:")
+            || lower.starts_with("keep-alive:")
+            || lower.starts_with("te:")
+            || lower.starts_with("trailers:")
+            || lower.starts_with("upgrade:")
+        {
+            continue;
+        }
+        if lower.starts_with("connection:") {
+            // Replace any Connection variant with `Connection: close`.
+            saw_connection = true;
+            out.extend_from_slice(b"Connection: close\r\n");
+            continue;
+        }
+        out.extend_from_slice(line);
+        out.extend_from_slice(b"\r\n");
+    }
+    if !saw_connection {
+        out.extend_from_slice(b"Connection: close\r\n");
+    }
+    out
+}
+
+/// Parse `host:port` (IPv4, hostname, or `[ipv6]:port`).
+fn parse_host_port(s: &str) -> Option<(String, u16)> {
+    let s = s.trim();
+    if let Some(stripped) = s.strip_prefix('[') {
+        // IPv6 literal: [::1]:443
+        let close = stripped.find(']')?;
+        let host = &stripped[..close];
+        let rest = &stripped[close + 1..];
+        let port = rest.strip_prefix(':')?.parse::<u16>().ok()?;
+        return Some((host.to_string(), port));
+    }
+    let (host, port) = s.rsplit_once(':')?;
+    let port = port.parse::<u16>().ok()?;
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), port))
+}
+
+/// Parse an absolute-URI proxy request target (`http://host[:port]/path`)
+/// into `(host, port, path)`. Returns None for anything that doesn't look
+/// like an http(s) URI — we won't honour `file://`, `ftp://`, etc., so a
+/// confused client gets a clean 400 instead of being silently rerouted.
+fn parse_absolute_uri(uri: &str) -> Option<(String, u16, String)> {
+    let (scheme, rest) = uri.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let default_port: u16 = match scheme.as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    // Authority may carry userinfo (`user:pass@host`) which we strip — the
+    // proxy doesn't propagate that level of auth into the SSH channel.
+    let authority = authority.rsplit_once('@').map(|x| x.1).unwrap_or(authority);
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(rest) => {
+            // [ipv6]:port — port optional
+            let close = rest.find(']')?;
+            let host = &rest[..close];
+            let after = &rest[close + 1..];
+            let port = if after.is_empty() {
+                default_port
+            } else {
+                after.strip_prefix(':')?.parse::<u16>().ok()?
+            };
+            (host.to_string(), port)
+        }
+        None => {
+            if let Some((host, port_s)) = authority.rsplit_once(':') {
+                let port = port_s.parse::<u16>().ok()?;
+                (host.to_string(), port)
+            } else {
+                (authority.to_string(), default_port)
+            }
+        }
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port, path.to_string()))
 }
 
 /// SOCKS4 / SOCKS4a — CONNECT (cmd 0x01) only. The version byte has already
