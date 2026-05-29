@@ -28,6 +28,7 @@ interface MirrorStatus {
   state: string;       // "starting" | "initial-sync" | "watching" | "error" | "stopped"
   queue_depth: number;
   uploaded: number;
+  downloaded: number;
   deleted: number;
   last_event_ms: number;
   error?: string;
@@ -270,7 +271,7 @@ const MirrorsPanel = ({ sessionId, configuredMirrors, disabled = false }: Mirror
               disabled={working}
               className="h-7 px-3 rounded text-[10px] font-bold uppercase tracking-wider bg-primary/15 text-primary border border-primary/30 hover:bg-primary/25 disabled:opacity-50"
             >
-              {working ? "…" : "Preview"}
+              {working ? "…" : "Continue"}
             </button>
           </div>
           {error && (
@@ -296,19 +297,23 @@ const MirrorsPanel = ({ sessionId, configuredMirrors, disabled = false }: Mirror
           </div>
           <div className="text-[11px] text-zinc-300 bg-black/40 border border-white/5 rounded p-2 max-h-40 overflow-auto custom-scrollbar font-mono">
             {pending.report.entries.length === 0 ? (
-              <div className="text-zinc-500 italic">Nothing new to upload — remote is already in sync.</div>
+              <div className="text-zinc-500 italic">Already in sync — nothing to move in either direction.</div>
             ) : (
-              pending.report.entries.slice(0, 200).map((e, i) => (
-                <div key={i} className="flex items-center gap-2 text-[10.5px]">
-                  <span className={`px-1 rounded text-[9px] font-bold uppercase shrink-0 ${
-                    e.action === "upload-new"
-                      ? "bg-emerald-500/15 text-emerald-300"
-                      : "bg-amber-500/15 text-amber-300"
-                  }`}>{e.action.replace("upload-", "")}</span>
-                  <span className="truncate flex-1 text-zinc-300">{e.path}</span>
-                  <span className="text-zinc-500 shrink-0">{fmtBytes(e.size)}</span>
-                </div>
-              ))
+              pending.report.entries.slice(0, 200).map((e, i) => {
+                const isDown = e.action.startsWith("download-");
+                const isNew = e.action.endsWith("-new");
+                const tone = isDown
+                  ? (isNew ? "bg-sky-500/15 text-sky-300"      : "bg-violet-500/15 text-violet-300")
+                  : (isNew ? "bg-emerald-500/15 text-emerald-300" : "bg-amber-500/15 text-amber-300");
+                const label = `${isDown ? "↓" : "↑"} ${isNew ? "new" : "mod"}`;
+                return (
+                  <div key={i} className="flex items-center gap-2 text-[10.5px]">
+                    <span className={`px-1 rounded text-[9px] font-bold uppercase shrink-0 ${tone}`}>{label}</span>
+                    <span className="truncate flex-1 text-zinc-300">{e.path}</span>
+                    <span className="text-zinc-500 shrink-0">{fmtBytes(e.size)}</span>
+                  </div>
+                );
+              })
             )}
             {pending.report.entries.length > 200 && (
               <div className="text-zinc-500 text-[10px] italic mt-1">… {pending.report.entries.length - 200} more</div>
@@ -382,6 +387,7 @@ const MirrorsPanel = ({ sessionId, configuredMirrors, disabled = false }: Mirror
                                                     "bg-white/5 text-zinc-400"
                   }`}>{live.state}</span>
                   <span>↑ {live.uploaded}</span>
+                  <span>↓ {live.downloaded}</span>
                   <span>✗ {live.deleted}</span>
                   {live.queue_depth > 0 && <span className="text-amber-300">queue {live.queue_depth}</span>}
                   {live.error && <span className="text-rose-400 truncate" title={live.error}>· {live.error}</span>}
@@ -466,6 +472,7 @@ const MirrorsPanel = ({ sessionId, configuredMirrors, disabled = false }: Mirror
                                       "text-zinc-400";
               const eventTone =
                 l.event === "upload"      ? "bg-emerald-500/15 text-emerald-300" :
+                l.event === "download"    ? "bg-sky-500/15 text-sky-300" :
                 l.event === "soft-delete" || l.event === "delete"
                                           ? "bg-amber-500/15 text-amber-300" :
                 l.event.endsWith("-fail") ? "bg-rose-500/15 text-rose-300" :

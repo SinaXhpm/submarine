@@ -86,6 +86,13 @@ notify = "6.1.1"
 # generating spurious traffic. Pairs cleanly with the `notify` 6.x crate
 # we already use elsewhere.
 notify-debouncer-mini = "0.4"
+# Used by the mirror module to stamp downloaded files with the remote's
+# mtime. Without it, every freshly-downloaded file has local mtime = now,
+# which would make the next dry-run treat the local copy as "newer" and
+# offer to re-upload it back. set_file_mtime is a single syscall and
+# `filetime` is the standard crate for it (works on Rust 1.70 — std::fs
+# alternatives need 1.75+).
+filetime = "0.2"
 regex = "1.10"
 # rustls-tls so we don't drag in OpenSSL on Windows builds. multipart for blob
 # uploads; json for typed request/response bodies.

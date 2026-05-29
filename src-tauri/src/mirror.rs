@@ -1,24 +1,30 @@
-//! One-way local → remote SFTP mirror.
+//! One-way live mirror, with a two-way initial reconciliation.
 //!
-//! The mirror watches a local directory and pushes every change up to a
-//! matching directory on the SSH server. It's deliberately unidirectional:
-//! we never read remote events back into the local FS. That trade-off is
-//! what makes the implementation tractable — SFTP has no push channel, so
-//! a bidirectional sync would mean polling, which is both slow and
-//! conflict-prone.
+//! Steady-state the mirror is unidirectional: a debounced local FS watcher
+//! pushes every change up to a matching directory on the SSH server, and
+//! we never read remote events back. SFTP has no push channel, so a fully
+//! bidirectional live sync would mean polling — slow, racy, and
+//! conflict-prone — which is why we don't.
+//!
+//! The *initial* sync is two-way though: we walk both sides and let the
+//! newer mtime win per file (missing-on-other-side counts as new). This
+//! is what the user actually wants on "start mirror" — they have a folder
+//! with some files locally and some files on the server, and the answer
+//! "merge them" matches expectation. After this one-shot reconciliation
+//! the watcher takes over and the rest of the session is push-only.
 //!
 //! Lifecycle of a single mirror:
 //!
-//!   1. `dry_run` walks the local tree and reports what *would* be uploaded.
-//!      The UI uses this for the "About to upload N files (X MB) — start?"
-//!      confirmation step. No SFTP traffic, no state changes.
+//!   1. `dry_run` walks both trees and reports what *would* move in either
+//!      direction. The UI uses this for the "N files to upload, M files to
+//!      download — continue?" confirmation step. No FS state changes.
 //!
-//!   2. `start` performs the initial sync (upload files newer / missing on
-//!      remote) then attaches a debounced FS watcher and processes events
-//!      one at a time through a worker. Each event reduces to a single
-//!      action — Upload if the path still exists locally, Delete if it
-//!      vanished — because the debouncer collapses bursts and the actual
-//!      operation we want depends only on the *current* state of the path.
+//!   2. `start` performs the initial two-way sync (newer mtime wins) then
+//!      attaches a debounced FS watcher and processes events one at a time
+//!      through a worker. Each event reduces to a single action — Upload
+//!      if the path still exists locally, Delete if it vanished — because
+//!      the debouncer collapses bursts and the actual operation we want
+//!      depends only on the *current* state of the path.
 //!
 //!   3. `stop` fires the oneshot signal and the worker tears down cleanly,
 //!      awaiting any in-flight upload to finish before returning.
@@ -80,6 +86,9 @@ pub struct MirrorStatus {
     /// Pending FS events queued for the worker.
     pub queue_depth: u32,
     pub uploaded: u32,
+    /// Only incremented during the initial reconciliation; the watcher
+    /// phase is push-only so it stays at the initial-sync value afterwards.
+    pub downloaded: u32,
     pub deleted: u32,
     /// Wall-clock time (ms since epoch) of the most recent successful action.
     pub last_event_ms: u128,
@@ -90,7 +99,7 @@ pub struct MirrorStatus {
 pub struct DryRunEntry {
     pub path: String,
     pub size: u64,
-    /// "upload-new" | "upload-modified"
+    /// "upload-new" | "upload-modified" | "download-new" | "download-modified"
     pub action: String,
 }
 
@@ -283,6 +292,41 @@ async fn sftp_upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Res
     Ok(())
 }
 
+/// Stream a remote file down into a local path. Mirror image of
+/// `sftp_upload_file`: chunked read so big files don't sit in RAM, parent
+/// directory created on demand. After a successful pull we stamp the
+/// local file's mtime to match the remote's so the next dry-run doesn't
+/// see the local copy as "newer" (it was just created — wall-clock now —
+/// even though its contents are exactly the remote's older bytes).
+async fn sftp_download_file(
+    sftp: &SftpSession,
+    remote: &str,
+    local: &Path,
+    remote_mtime_secs: Option<u64>,
+) -> Result<(), String> {
+    if let Some(parent) = local.parent() {
+        tokio::fs::create_dir_all(parent).await
+            .map_err(|e| format!("local mkdir {:?}: {}", parent, e))?;
+    }
+    let mut handle = sftp.open(remote).await
+        .map_err(|e| format!("sftp open {}: {}", remote, e))?;
+    let mut f = tokio::fs::File::create(local).await
+        .map_err(|e| format!("local create {:?}: {}", local, e))?;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = handle.read(&mut buf).await.map_err(|e| format!("sftp read: {}", e))?;
+        if n == 0 { break; }
+        f.write_all(&buf[..n]).await.map_err(|e| format!("local write: {}", e))?;
+    }
+    f.flush().await.ok();
+    drop(f);
+    if let Some(secs) = remote_mtime_secs {
+        let ft = filetime::FileTime::from_unix_time(secs as i64, 0);
+        let _ = filetime::set_file_mtime(local, ft);
+    }
+    Ok(())
+}
+
 /// Move a remote path into `<remote_root>/.submarine-trash/<timestamp>/`
 /// preserving the relative layout. Cheaper than a full delete and lets the
 /// user recover from a bad local action without server-side support.
@@ -328,7 +372,13 @@ pub async fn dry_run(
 
     let mut entries = Vec::new();
     let mut total_bytes: u64 = 0;
+    // Two-way reconciliation: local walk pushes anything newer-or-missing
+    // up, then remote walk pulls anything newer-or-missing down. The two
+    // checks are symmetric and can't double-count: walk_local skips a file
+    // when remote is newer/equal, and walk_remote skips it when local is
+    // newer/equal, so each file lands in at most one bucket.
     walk_local(&local_root, &local_root, &spec.remote, &spec.excludes, &sftp, &mut entries, &mut total_bytes).await?;
+    walk_remote(&sftp, &local_root, &spec.remote, &spec.remote, &spec.excludes, &mut entries, &mut total_bytes).await?;
     Ok(DryRunReport { entries, total_bytes })
 }
 
@@ -373,6 +423,63 @@ async fn walk_local(
     Ok(())
 }
 
+/// Recursive walk over the remote tree via SFTP. Symmetric counterpart to
+/// `walk_local`: any remote file that's missing locally or newer than the
+/// local copy gets flagged for download. A missing remote root is treated
+/// as "nothing to download" (Ok with no entries) rather than an error —
+/// the user may legitimately be mirroring into a fresh remote path that
+/// the upload pass will create. We also hard-skip `.submarine-trash` so
+/// the soft-delete archive never gets dragged back into the local tree.
+async fn walk_remote(
+    sftp: &SftpSession,
+    local_root: &Path,
+    remote_root: &str,
+    remote_dir: &str,
+    excludes: &[String],
+    out: &mut Vec<DryRunEntry>,
+    total: &mut u64,
+) -> Result<(), String> {
+    let read = match sftp.read_dir(remote_dir).await {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+    let trimmed_root = remote_root.trim_end_matches('/').to_string();
+    let prefix = format!("{}/", trimmed_root);
+    let items: Vec<_> = read.collect();
+    for entry in items {
+        let name = entry.file_name();
+        if name == "." || name == ".." { continue; }
+        let remote_path = format!("{}/{}", remote_dir.trim_end_matches('/'), name);
+        let rel = remote_path.strip_prefix(&prefix)
+            .unwrap_or(remote_path.as_str())
+            .to_string();
+        if rel.starts_with(".submarine-trash") { continue; }
+        if is_excluded(&rel, excludes) { continue; }
+
+        let is_dir = entry.file_type().is_dir();
+        if is_dir {
+            Box::pin(walk_remote(sftp, local_root, remote_root, &remote_path, excludes, out, total)).await?;
+            continue;
+        }
+        let attr = entry.metadata();
+        let remote_secs = attr.mtime.map(|t| t as u64).unwrap_or(0);
+        let size = attr.size.unwrap_or(0);
+        let local_path = local_root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let action = match tokio::fs::metadata(&local_path).await {
+            Err(_) => "download-new",
+            Ok(m) => {
+                let local_secs = m.modified().ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs()).unwrap_or(0);
+                if remote_secs > local_secs { "download-modified" } else { continue }
+            }
+        };
+        out.push(DryRunEntry { path: rel, size, action: action.into() });
+        *total = total.saturating_add(size);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Public entry — start_mirror
 // ---------------------------------------------------------------------------
@@ -398,6 +505,7 @@ pub async fn start(
         state: "starting".into(),
         queue_depth: 0,
         uploaded: 0,
+        downloaded: 0,
         deleted: 0,
         last_event_ms: now_ms(),
         error: None,
@@ -495,32 +603,47 @@ async fn run_mirror(
     let local_root = PathBuf::from(&spec.local);
     let sftp = open_sftp(&handle).await?;
 
-    // --- Initial sync: walk local, upload anything missing/newer ---
+    // --- Initial sync: two-way reconciliation, newer mtime wins ---
     set_state(&app, &status, "initial-sync", None).await;
-    let mut to_push = Vec::new();
+    let mut work = Vec::new();
     let mut total = 0u64;
     walk_local(&local_root, &local_root, &spec.remote, &spec.excludes,
-               &sftp, &mut to_push, &mut total).await?;
-    for entry in &to_push {
-        if !stop_rx.try_recv().is_err() { return Ok(()); }
+               &sftp, &mut work, &mut total).await?;
+    walk_remote(&sftp, &local_root, &spec.remote, &spec.remote, &spec.excludes,
+                &mut work, &mut total).await?;
+    for entry in &work {
+        if stop_rx.try_recv().is_ok() { return Ok(()); }
         let local_path = local_root.join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR));
         let remote_path = match local_to_remote(&local_path, &local_root, &spec.remote) {
             Some(r) => r, None => continue,
         };
-        match sftp_upload_file(&sftp, &local_path, &remote_path).await {
+        let is_download = entry.action.starts_with("download-");
+        let res = if is_download {
+            let mt = sftp_remote_mtime(&sftp, &remote_path).await;
+            sftp_download_file(&sftp, &remote_path, &local_path, mt).await
+        } else {
+            sftp_upload_file(&sftp, &local_path, &remote_path).await
+        };
+        match res {
             Ok(_) => {
                 {
                     let mut s = status.lock().await;
-                    s.uploaded = s.uploaded.saturating_add(1);
+                    if is_download {
+                        s.downloaded = s.downloaded.saturating_add(1);
+                    } else {
+                        s.uploaded = s.uploaded.saturating_add(1);
+                    }
                     s.last_event_ms = now_ms();
                 }
                 emit_update(&app, &status.lock().await.clone()).await;
-                emit_log(&app, &session_id, &mirror_id, "info", "upload",
+                emit_log(&app, &session_id, &mirror_id, "info",
+                         if is_download { "download" } else { "upload" },
                          Some(entry.path.clone()),
                          Some(format!("{} ({} bytes)", entry.action, entry.size)));
             }
             Err(e) => {
-                emit_log(&app, &session_id, &mirror_id, "error", "upload-fail",
+                emit_log(&app, &session_id, &mirror_id, "error",
+                         if is_download { "download-fail" } else { "upload-fail" },
                          Some(entry.path.clone()), Some(e));
             }
         }
