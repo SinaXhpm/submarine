@@ -125,13 +125,47 @@ const TerminalView = ({
         return false;
       }
     };
+    // term.getSelection() emits one '\n' per buffer row, including rows that
+    // are mid-wrap continuations of the previous logical line — paste that
+    // into anything and you get a phantom blank between every wrapped
+    // segment. Walk the buffer ourselves using `isWrapped` so a wrapped
+    // line round-trips as a single line. Plain (non-wrapped) row breaks
+    // stay '\n'.
+    const buildSelectedText = (): string => {
+      const range = term.getSelectionPosition();
+      if (!range) return '';
+      const buf = term.buffer.active;
+      const lines: string[] = [];
+      for (let y = range.start.y; y <= range.end.y; y++) {
+        const line = buf.getLine(y);
+        if (!line) continue;
+        const startX = y === range.start.y ? range.start.x : 0;
+        const endX   = y === range.end.y   ? range.end.x   : undefined;
+        const text = line.translateToString(true, startX, endX);
+        if (y > range.start.y && line.isWrapped && lines.length > 0) {
+          lines[lines.length - 1] += text;
+        } else {
+          lines.push(text);
+        }
+      }
+      return lines.join('\n');
+    };
     const copySelectionIfAny = async () => {
-      const sel = term.getSelection();
-      if (!sel) return;
-      const ok = await writeClipboard(sel);
+      const text = buildSelectedText();
+      if (!text) return;
+      const ok = await writeClipboard(text);
       if (ok) notify('Copied');
     };
-    const onMouseUp = () => { void copySelectionIfAny(); };
+    // Only copy when the release actually lands on the text grid. xterm's
+    // text rows live inside .xterm-screen in both renderers; releasing on
+    // padding, the viewport scrollbar, or anything outside that subtree
+    // means the user didn't finish on text — drop the copy so a stray
+    // click on the gutter doesn't clobber the clipboard.
+    const onMouseUp = (ev: MouseEvent) => {
+      const target = ev.target as HTMLElement | null;
+      if (!target || !target.closest('.xterm-screen')) return;
+      void copySelectionIfAny();
+    };
     // Right-click → paste clipboard into the PTY. preventDefault swallows the
     // platform context menu so the user gets the terminal-style behavior they
     // asked for. Disabled sessions silently drop the paste (matches onData).

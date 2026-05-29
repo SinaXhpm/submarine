@@ -2,6 +2,17 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Native <select> renders its dropdown via the OS theme, which defaults
+   to a white list — our dark form text becomes unreadable against it.
+   Style the option rows directly so the dropdown matches the panels.
+   Only takes effect on Chromium (what Tauri's WebView uses), which is
+   the only renderer we ship to. */
+select option,
+select optgroup {
+  background-color: #1a1a1e;
+  color: #e4e4e7;
+}
+
 @layer base {
   :root {
     --background: #0a0a0c;
