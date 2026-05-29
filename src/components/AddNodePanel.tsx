@@ -261,7 +261,7 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                   type="button"
                   onClick={() => setNewNode({
                     ...newNode,
-                    mirrors: [...(newNode.mirrors || []), { local: "", remote: "", soft_delete: true, excludes: [] }],
+                    mirrors: [...(newNode.mirrors || []), { local: "", remote: "", soft_delete: true, excludes: [], conflict_resolution: "local" }],
                   })}
                   className="text-[11px] font-bold text-primary hover:text-primary transition-colors"
                 >+ Add</button>
@@ -313,6 +313,20 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                         />
                         <span>Soft delete</span>
                       </label>
+                      <select
+                        value={m.conflict_resolution || "local"}
+                        onChange={(e) => {
+                          const next = [...newNode.mirrors];
+                          next[idx] = { ...next[idx], conflict_resolution: e.target.value };
+                          setNewNode({ ...newNode, mirrors: next });
+                        }}
+                        title="Initial-sync conflict resolution: which side overwrites when a file exists on both with different content. Files missing on one side always copy across."
+                        className="h-6 px-1.5 bg-black/30 border border-white/10 rounded text-[10.5px] text-zinc-300 outline-none focus:border-primary/40"
+                      >
+                        <option value="local">Local wins</option>
+                        <option value="remote">Remote wins</option>
+                        <option value="newer">Newer wins</option>
+                      </select>
                       <input
                         className="flex-1 min-w-0 h-6 bg-transparent rounded px-1 text-[10.5px] font-mono text-zinc-400 placeholder:text-zinc-700 outline-none"
                         placeholder="Excludes: .git, node_modules, *.swp"

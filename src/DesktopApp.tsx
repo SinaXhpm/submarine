@@ -84,7 +84,7 @@ function DesktopApp() {
     proxyType: "none", proxyHost: "", proxyPort: 1080,
     tunnels: [] as { local: string, remote: string, type: string }[],
     autostart: false,
-    mirrors: [] as { local: string, remote: string, soft_delete: boolean, excludes: string[] }[],
+    mirrors: [] as { local: string, remote: string, soft_delete: boolean, excludes: string[], conflict_resolution: string }[],
   };
 
   // Live width-based "narrow viewport" flag. Replaces a one-shot UA check

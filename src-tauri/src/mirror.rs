@@ -72,9 +72,20 @@ pub struct MirrorSpec {
     /// hit skips upload / delete propagation.
     #[serde(default)]
     pub excludes: Vec<String>,
+    /// How to resolve initial-sync conflicts (file exists on both sides
+    /// with different content). Values:
+    ///   - "local"  → local content overwrites remote (default; matches
+    ///                rsync's source-wins convention and the live watcher's
+    ///                push-only direction)
+    ///   - "remote" → remote content overwrites local
+    ///   - "newer"  → file with the later mtime wins
+    /// Files missing on one side are always copied across (no conflict).
+    #[serde(default = "default_conflict")]
+    pub conflict_resolution: String,
 }
 
 fn default_true() -> bool { true }
+fn default_conflict() -> String { "local".to_string() }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MirrorStatus {
@@ -268,11 +279,14 @@ async fn local_mtime(path: &Path) -> Option<u64> {
 
 /// Stream a single file from disk into a freshly-opened SFTP write handle.
 /// We chunk the read so a multi-GB file doesn't try to live in RAM at once.
-/// After a successful upload we pin the remote mtime to the local file's
-/// mtime — the symmetric counterpart to what `sftp_download_file` does
-/// locally. Without this step every uploaded file would pick up the SFTP
-/// server's wall clock as its mtime, the next dry-run would see local <
-/// remote, and offer to download the just-uploaded file right back.
+///
+/// We do NOT touch the remote's mtime after upload — earlier versions did,
+/// and at least one SFTP server interpreted the round-tripped SETSTAT in
+/// a way that re-truncated the file to zero (the `mod up → empty file`
+/// bug). The downside of skipping is that subsequent dry-runs will see
+/// the just-uploaded file with local-mtime ≠ remote-mtime and fall back
+/// to the hash compare; but that's harmless — same content hashes equal,
+/// the file is correctly marked Identical, and no transfer happens.
 async fn sftp_upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Result<(), String> {
     if let Some(parent) = std::path::Path::new(remote).parent() {
         let pstr = parent.to_string_lossy().replace('\\', "/");
@@ -293,22 +307,11 @@ async fn sftp_upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Res
         if n == 0 { break; }
         handle.write_all(&buf[..n]).await.map_err(|e| format!("sftp write: {}", e))?;
     }
-    handle.shutdown().await.ok();
-    drop(handle);
-
-    if let Ok(meta) = tokio::fs::metadata(local).await {
-        if let Ok(modified) = meta.modified() {
-            if let Ok(d) = modified.duration_since(UNIX_EPOCH) {
-                let secs = d.as_secs() as u32;
-                let mut attrs = FileAttributes::default();
-                attrs.mtime = Some(secs);
-                attrs.atime = Some(secs);
-                // Best-effort: some servers refuse SETSTAT for non-owners.
-                // The upload itself succeeded so we don't propagate.
-                let _ = sftp.set_metadata(remote, attrs).await;
-            }
-        }
-    }
+    // Flush queued writes then close cleanly. Errors here are real — they
+    // mean bytes didn't land. Earlier the close error was `.ok()`-swallowed,
+    // which would mask a half-written file as success.
+    handle.flush().await.map_err(|e| format!("sftp flush {}: {}", remote, e))?;
+    handle.shutdown().await.map_err(|e| format!("sftp close {}: {}", remote, e))?;
     Ok(())
 }
 
@@ -484,6 +487,7 @@ pub async fn dry_run(
     // remote-only paths. This split avoids hashing each ambiguous
     // file twice.
     walk_local(&local_root, &local_root, &spec.remote, &spec.excludes, &sftp,
+               &spec.conflict_resolution,
                &mut entries, &mut total_bytes, &mut seen).await?;
     walk_remote(&sftp, &local_root, &spec.remote, &spec.remote, &spec.excludes,
                 &mut entries, &mut total_bytes, &seen).await?;
@@ -491,16 +495,17 @@ pub async fn dry_run(
 }
 
 /// Recursive walk over the LOCAL tree. For each file we ask compare_files
-/// whether the remote copy is missing / older / equal / newer, and emit
-/// the matching entry (or nothing). Every visited rel path goes into
-/// `seen` so walk_remote can identify which remote files weren't covered
-/// by walk_local and need a download-new entry.
+/// whether the remote copy is missing / equal / newer / older, then pick a
+/// direction using the mirror's `conflict_resolution` setting. Every
+/// visited rel path goes into `seen` so walk_remote can identify which
+/// remote files weren't covered here and need a download-new entry.
 async fn walk_local(
     root: &Path,
     dir: &Path,
     remote_root: &str,
     excludes: &[String],
     sftp: &SftpSession,
+    conflict_mode: &str,
     out: &mut Vec<DryRunEntry>,
     total: &mut u64,
     seen: &mut HashSet<String>,
@@ -512,7 +517,7 @@ async fn walk_local(
         if is_excluded(&rel, excludes) { continue; }
         let meta = match entry.metadata().await { Ok(m) => m, Err(_) => continue };
         if meta.is_dir() {
-            Box::pin(walk_local(root, &path, remote_root, excludes, sftp, out, total, seen)).await?;
+            Box::pin(walk_local(root, &path, remote_root, excludes, sftp, conflict_mode, out, total, seen)).await?;
             continue;
         }
         if !meta.is_file() { continue; } // skip symlinks / sockets / pipes
@@ -523,12 +528,23 @@ async fn walk_local(
         let size = meta.len();
         let remote_attr = sftp.metadata(&remote_path).await.ok();
         let action = match remote_attr {
+            // Missing on the other side is never a conflict — copy across.
             None => "upload-new",
-            Some(attr) => match compare_files(sftp, &path, &remote_path, &meta, &attr).await? {
-                CompareResult::Identical   => continue,
-                CompareResult::LocalNewer  => "upload-modified",
-                CompareResult::RemoteNewer => "download-modified",
-            },
+            Some(attr) => {
+                let cmp = compare_files(sftp, &path, &remote_path, &meta, &attr).await?;
+                match cmp {
+                    CompareResult::Identical => continue,
+                    // Same-content cases that *do* differ — pick a side per mode.
+                    CompareResult::LocalNewer | CompareResult::RemoteNewer => {
+                        let local_wins = match conflict_mode {
+                            "remote" => false,
+                            "newer"  => matches!(cmp, CompareResult::LocalNewer),
+                            _        => true,  // "local" or unknown → safe default
+                        };
+                        if local_wins { "upload-modified" } else { "download-modified" }
+                    }
+                }
+            }
         };
         out.push(DryRunEntry { path: rel, size, action: action.into() });
         *total = total.saturating_add(size);
@@ -717,7 +733,8 @@ async fn run_mirror(
     let mut total = 0u64;
     let mut seen = HashSet::new();
     walk_local(&local_root, &local_root, &spec.remote, &spec.excludes,
-               &sftp, &mut work, &mut total, &mut seen).await?;
+               &sftp, &spec.conflict_resolution,
+               &mut work, &mut total, &mut seen).await?;
     walk_remote(&sftp, &local_root, &spec.remote, &spec.remote, &spec.excludes,
                 &mut work, &mut total, &seen).await?;
     for entry in &work {

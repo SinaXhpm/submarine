@@ -13,11 +13,16 @@ import {
 // sync would push, (3) start / stop the live watcher, and (4) read a
 // rolling log of upload / delete / error events as the watcher fires.
 
+type ConflictMode = "local" | "remote" | "newer";
+
 interface MirrorSpec {
   local: string;
   remote: string;
   soft_delete: boolean;
   excludes: string[];
+  // Initial-sync collision rule. "local" matches rsync's source-wins default
+  // and is what most users expect for a tool literally called "mirror".
+  conflict_resolution: ConflictMode;
 }
 
 interface MirrorStatus {
@@ -61,7 +66,7 @@ const MirrorsPanel = ({ sessionId, configuredMirrors, disabled = false }: Mirror
   const [logs, setLogs] = useState<MirrorLogEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
-  const [draft, setDraft] = useState<MirrorSpec>({ local: "", remote: "", soft_delete: true, excludes: [] });
+  const [draft, setDraft] = useState<MirrorSpec>({ local: "", remote: "", soft_delete: true, excludes: [], conflict_resolution: "local" });
   const [excludesText, setExcludesText] = useState("");
   // Map from configured-mirror index (by `local|remote` key) to the live
   // mirror id while it's running. Lets us show Start vs Stop on each row
@@ -154,8 +159,12 @@ const MirrorsPanel = ({ sessionId, configuredMirrors, disabled = false }: Mirror
     if (working) return;
     setWorking(true); setError(null);
     try {
-      const report: DryRunReport = await invoke("mirror_dry_run", { sessionId, spec });
-      setPending({ spec, report });
+      // Saved mirrors written before the conflict_resolution field existed
+      // come back from the vault without it. Backfill the default here so
+      // the preview/start round-trip carries a value the UI can also display.
+      const norm: MirrorSpec = { ...spec, conflict_resolution: spec.conflict_resolution || "local" };
+      const report: DryRunReport = await invoke("mirror_dry_run", { sessionId, spec: norm });
+      setPending({ spec: norm, report });
     } catch (e: any) {
       setError(String(e));
     } finally {
@@ -174,7 +183,7 @@ const MirrorsPanel = ({ sessionId, configuredMirrors, disabled = false }: Mirror
       // user wants to see while initial sync runs.
       setPending(null);
       setAdding(false);
-      setDraft({ local: "", remote: "", soft_delete: true, excludes: [] });
+      setDraft({ local: "", remote: "", soft_delete: true, excludes: [], conflict_resolution: "local" });
       setExcludesText("");
     } catch (e: any) {
       setError(String(e));
@@ -263,6 +272,19 @@ const MirrorsPanel = ({ sessionId, configuredMirrors, disabled = false }: Mirror
             rows={2}
             className="w-full p-2 bg-white/[0.04] border border-white/10 rounded text-[10.5px] font-mono text-zinc-300 placeholder-zinc-600 resize-none focus:outline-none focus:border-primary/40"
           />
+          <div className="flex items-center gap-2 text-[10.5px] text-zinc-400">
+            <span className="shrink-0 uppercase tracking-wider font-bold text-zinc-500 text-[9.5px]">On conflict</span>
+            <select
+              value={draft.conflict_resolution}
+              onChange={(e) => setDraft({ ...draft, conflict_resolution: e.target.value as ConflictMode })}
+              className="h-7 px-2 bg-white/[0.04] border border-white/10 rounded text-[11px] text-zinc-200 outline-none focus:border-primary/40"
+              title="Decides which side wins when a file exists on both sides with different content. Missing-on-one-side files always copy across regardless."
+            >
+              <option value="local">Local wins (overwrite remote)</option>
+              <option value="remote">Remote wins (overwrite local)</option>
+              <option value="newer">Newer mtime wins</option>
+            </select>
+          </div>
           <div className="flex items-center justify-between gap-2">
             <label className="flex items-center gap-2 text-[10.5px] text-zinc-400 select-none">
               <input
