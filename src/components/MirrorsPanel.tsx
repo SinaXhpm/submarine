@@ -168,7 +168,14 @@ const MirrorsPanel = ({ sessionId, configuredMirrors, disabled = false }: Mirror
     setWorking(true); setError(null);
     try {
       await invoke("start_mirror", { sessionId, spec: pending.spec });
+      // Mirror is now spawned — collapse the preview, close the ad-hoc
+      // form, and reset the draft inputs. The newly-started mirror takes
+      // over as a live status row in the list below, which is what the
+      // user wants to see while initial sync runs.
       setPending(null);
+      setAdding(false);
+      setDraft({ local: "", remote: "", soft_delete: true, excludes: [] });
+      setExcludesText("");
     } catch (e: any) {
       setError(String(e));
     } finally {

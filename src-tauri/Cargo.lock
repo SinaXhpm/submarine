@@ -4826,6 +4826,7 @@ dependencies = [
  "russh-sftp",
  "serde",
  "serde_json",
+ "sha2",
  "ssh-key",
  "tauri",
  "tauri-build",

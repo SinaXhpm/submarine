@@ -34,7 +34,7 @@
 //! nuke the remote copy. The user can flip `soft_delete = false` per
 //! mirror if they actually want hard deletes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -44,6 +44,7 @@ use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode, DebouncedEvent
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, Mutex};
@@ -267,8 +268,12 @@ async fn local_mtime(path: &Path) -> Option<u64> {
 
 /// Stream a single file from disk into a freshly-opened SFTP write handle.
 /// We chunk the read so a multi-GB file doesn't try to live in RAM at once.
+/// After a successful upload we pin the remote mtime to the local file's
+/// mtime — the symmetric counterpart to what `sftp_download_file` does
+/// locally. Without this step every uploaded file would pick up the SFTP
+/// server's wall clock as its mtime, the next dry-run would see local <
+/// remote, and offer to download the just-uploaded file right back.
 async fn sftp_upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Result<(), String> {
-    // Make sure the parent directory exists. Cheap when it already does.
     if let Some(parent) = std::path::Path::new(remote).parent() {
         let pstr = parent.to_string_lossy().replace('\\', "/");
         if !pstr.is_empty() && pstr != "/" {
@@ -289,6 +294,21 @@ async fn sftp_upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Res
         handle.write_all(&buf[..n]).await.map_err(|e| format!("sftp write: {}", e))?;
     }
     handle.shutdown().await.ok();
+    drop(handle);
+
+    if let Ok(meta) = tokio::fs::metadata(local).await {
+        if let Ok(modified) = meta.modified() {
+            if let Ok(d) = modified.duration_since(UNIX_EPOCH) {
+                let secs = d.as_secs() as u32;
+                let mut attrs = FileAttributes::default();
+                attrs.mtime = Some(secs);
+                attrs.atime = Some(secs);
+                // Best-effort: some servers refuse SETSTAT for non-owners.
+                // The upload itself succeeded so we don't propagate.
+                let _ = sftp.set_metadata(remote, attrs).await;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -357,7 +377,91 @@ async fn sftp_hard_delete(sftp: &SftpSession, target: &str) -> Result<(), String
 }
 
 // ---------------------------------------------------------------------------
-// Dry-run: walk local tree and report what we'd push
+// Content comparison
+// ---------------------------------------------------------------------------
+//
+// rsync's default "quick check" treats two files as equal when both their
+// size and mtime match. That's wrong in the strict sense — a file edited
+// in-place that preserves its size and gets `touch -m`-ed back to the old
+// mtime would slip through — but it's correct in every practical scenario
+// and cheap. For the cases where the quick check *can't* decide (same
+// size, different mtimes) we fall back to a full SHA-256 of both sides
+// so we don't get fooled by a server with skewed clocks or an editor
+// that touches mtime without changing content.
+//
+// Different sizes always mean different content; we don't bother hashing.
+// "Newer wins" is then a stable rule for picking the direction of the
+// transfer.
+
+enum CompareResult {
+    Identical,
+    LocalNewer,
+    RemoteNewer,
+}
+
+async fn local_sha256(path: &Path) -> Result<[u8; 32], String> {
+    let mut f = tokio::fs::File::open(path).await
+        .map_err(|e| format!("local open {:?}: {}", path, e))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).await.map_err(|e| format!("local read: {}", e))?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+async fn sftp_sha256(sftp: &SftpSession, remote: &str) -> Result<[u8; 32], String> {
+    let mut h = sftp.open(remote).await
+        .map_err(|e| format!("sftp open {}: {}", remote, e))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = h.read(&mut buf).await.map_err(|e| format!("sftp read: {}", e))?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+async fn compare_files(
+    sftp: &SftpSession,
+    local: &Path,
+    remote: &str,
+    local_meta: &std::fs::Metadata,
+    remote_attr: &FileAttributes,
+) -> Result<CompareResult, String> {
+    let local_size = local_meta.len();
+    let remote_size = remote_attr.size.unwrap_or(0);
+    let local_secs = local_meta.modified().ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs()).unwrap_or(0);
+    let remote_secs = remote_attr.mtime.map(|t| t as u64).unwrap_or(0);
+
+    if local_size != remote_size {
+        return Ok(if local_secs >= remote_secs { CompareResult::LocalNewer }
+                  else { CompareResult::RemoteNewer });
+    }
+    // Same size, same mtime → call it equal. Empty files we also call equal
+    // because the hash is degenerate and would just confirm what we know.
+    if local_secs == remote_secs {
+        return Ok(CompareResult::Identical);
+    }
+    // Same size, different mtime — the only ambiguous bucket. Hash both
+    // sides and trust the digests. If they actually match, the difference
+    // was clock drift / a metadata-only touch and there's nothing to move.
+    let lh = local_sha256(local).await?;
+    let rh = sftp_sha256(sftp, remote).await?;
+    if lh == rh {
+        return Ok(CompareResult::Identical);
+    }
+    Ok(if local_secs >= remote_secs { CompareResult::LocalNewer }
+       else { CompareResult::RemoteNewer })
+}
+
+// ---------------------------------------------------------------------------
+// Dry-run: walk both trees and report what to move
 // ---------------------------------------------------------------------------
 
 pub async fn dry_run(
@@ -372,18 +476,25 @@ pub async fn dry_run(
 
     let mut entries = Vec::new();
     let mut total_bytes: u64 = 0;
-    // Two-way reconciliation: local walk pushes anything newer-or-missing
-    // up, then remote walk pulls anything newer-or-missing down. The two
-    // checks are symmetric and can't double-count: walk_local skips a file
-    // when remote is newer/equal, and walk_remote skips it when local is
-    // newer/equal, so each file lands in at most one bucket.
-    walk_local(&local_root, &local_root, &spec.remote, &spec.excludes, &sftp, &mut entries, &mut total_bytes).await?;
-    walk_remote(&sftp, &local_root, &spec.remote, &spec.remote, &spec.excludes, &mut entries, &mut total_bytes).await?;
+    let mut seen = HashSet::new();
+    // walk_local does the bulk of the work: for every local file it
+    // decides upload-* / download-* / skip via compare_files (size,
+    // mtime, hash-on-tie). walk_remote then only fills in the gap —
+    // files that exist on the server but not in `seen`, i.e. truly
+    // remote-only paths. This split avoids hashing each ambiguous
+    // file twice.
+    walk_local(&local_root, &local_root, &spec.remote, &spec.excludes, &sftp,
+               &mut entries, &mut total_bytes, &mut seen).await?;
+    walk_remote(&sftp, &local_root, &spec.remote, &spec.remote, &spec.excludes,
+                &mut entries, &mut total_bytes, &seen).await?;
     Ok(DryRunReport { entries, total_bytes })
 }
 
-/// Recursive walk. We do this hand-rolled rather than via `walkdir` so we
-/// can interleave the SFTP stat calls without spawning a parallel thread.
+/// Recursive walk over the LOCAL tree. For each file we ask compare_files
+/// whether the remote copy is missing / older / equal / newer, and emit
+/// the matching entry (or nothing). Every visited rel path goes into
+/// `seen` so walk_remote can identify which remote files weren't covered
+/// by walk_local and need a download-new entry.
 async fn walk_local(
     root: &Path,
     dir: &Path,
@@ -392,6 +503,7 @@ async fn walk_local(
     sftp: &SftpSession,
     out: &mut Vec<DryRunEntry>,
     total: &mut u64,
+    seen: &mut HashSet<String>,
 ) -> Result<(), String> {
     let mut rd = tokio::fs::read_dir(dir).await.map_err(|e| format!("read_dir {:?}: {}", dir, e))?;
     while let Some(entry) = rd.next_entry().await.map_err(|e| format!("dir iter: {}", e))? {
@@ -400,22 +512,23 @@ async fn walk_local(
         if is_excluded(&rel, excludes) { continue; }
         let meta = match entry.metadata().await { Ok(m) => m, Err(_) => continue };
         if meta.is_dir() {
-            Box::pin(walk_local(root, &path, remote_root, excludes, sftp, out, total)).await?;
+            Box::pin(walk_local(root, &path, remote_root, excludes, sftp, out, total, seen)).await?;
             continue;
         }
         if !meta.is_file() { continue; } // skip symlinks / sockets / pipes
         let remote_path = match local_to_remote(&path, root, remote_root) {
             Some(r) => r, None => continue,
         };
-        let local_secs = meta.modified().ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs()).unwrap_or(0);
-        let remote_secs = sftp_remote_mtime(sftp, &remote_path).await;
+        seen.insert(rel.clone());
         let size = meta.len();
-        let action = match remote_secs {
+        let remote_attr = sftp.metadata(&remote_path).await.ok();
+        let action = match remote_attr {
             None => "upload-new",
-            Some(rs) if local_secs > rs => "upload-modified",
-            Some(_) => continue, // up-to-date or remote newer — skip
+            Some(attr) => match compare_files(sftp, &path, &remote_path, &meta, &attr).await? {
+                CompareResult::Identical   => continue,
+                CompareResult::LocalNewer  => "upload-modified",
+                CompareResult::RemoteNewer => "download-modified",
+            },
         };
         out.push(DryRunEntry { path: rel, size, action: action.into() });
         *total = total.saturating_add(size);
@@ -423,13 +536,17 @@ async fn walk_local(
     Ok(())
 }
 
-/// Recursive walk over the remote tree via SFTP. Symmetric counterpart to
-/// `walk_local`: any remote file that's missing locally or newer than the
-/// local copy gets flagged for download. A missing remote root is treated
-/// as "nothing to download" (Ok with no entries) rather than an error —
-/// the user may legitimately be mirroring into a fresh remote path that
-/// the upload pass will create. We also hard-skip `.submarine-trash` so
-/// the soft-delete archive never gets dragged back into the local tree.
+/// Recursive walk over the remote tree via SFTP. walk_local already
+/// covered every file that exists locally (and chose Identical / upload /
+/// download for it via compare_files). All that's left for walk_remote is
+/// the remote-only files: anything whose rel path isn't in `seen` is a
+/// file the local tree doesn't have, so it becomes a download-new entry.
+///
+/// A missing remote root is treated as "nothing to do" rather than an
+/// error — the user may legitimately be mirroring into a fresh remote
+/// path that the upload pass will create. We hard-skip `.submarine-trash`
+/// so the soft-delete archive never gets dragged back into the local
+/// tree.
 async fn walk_remote(
     sftp: &SftpSession,
     local_root: &Path,
@@ -438,6 +555,7 @@ async fn walk_remote(
     excludes: &[String],
     out: &mut Vec<DryRunEntry>,
     total: &mut u64,
+    seen: &HashSet<String>,
 ) -> Result<(), String> {
     let read = match sftp.read_dir(remote_dir).await {
         Ok(r) => r,
@@ -456,25 +574,15 @@ async fn walk_remote(
         if rel.starts_with(".submarine-trash") { continue; }
         if is_excluded(&rel, excludes) { continue; }
 
-        let is_dir = entry.file_type().is_dir();
-        if is_dir {
-            Box::pin(walk_remote(sftp, local_root, remote_root, &remote_path, excludes, out, total)).await?;
+        if entry.file_type().is_dir() {
+            Box::pin(walk_remote(sftp, local_root, remote_root, &remote_path, excludes, out, total, seen)).await?;
             continue;
         }
+        // walk_local already decided this file's fate — don't double-emit.
+        if seen.contains(&rel) { continue; }
         let attr = entry.metadata();
-        let remote_secs = attr.mtime.map(|t| t as u64).unwrap_or(0);
         let size = attr.size.unwrap_or(0);
-        let local_path = local_root.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
-        let action = match tokio::fs::metadata(&local_path).await {
-            Err(_) => "download-new",
-            Ok(m) => {
-                let local_secs = m.modified().ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs()).unwrap_or(0);
-                if remote_secs > local_secs { "download-modified" } else { continue }
-            }
-        };
-        out.push(DryRunEntry { path: rel, size, action: action.into() });
+        out.push(DryRunEntry { path: rel, size, action: "download-new".into() });
         *total = total.saturating_add(size);
     }
     Ok(())
@@ -603,14 +711,15 @@ async fn run_mirror(
     let local_root = PathBuf::from(&spec.local);
     let sftp = open_sftp(&handle).await?;
 
-    // --- Initial sync: two-way reconciliation, newer mtime wins ---
+    // --- Initial sync: two-way reconciliation, content-aware ---
     set_state(&app, &status, "initial-sync", None).await;
     let mut work = Vec::new();
     let mut total = 0u64;
+    let mut seen = HashSet::new();
     walk_local(&local_root, &local_root, &spec.remote, &spec.excludes,
-               &sftp, &mut work, &mut total).await?;
+               &sftp, &mut work, &mut total, &mut seen).await?;
     walk_remote(&sftp, &local_root, &spec.remote, &spec.remote, &spec.excludes,
-                &mut work, &mut total).await?;
+                &mut work, &mut total, &seen).await?;
     for entry in &work {
         if stop_rx.try_recv().is_ok() { return Ok(()); }
         let local_path = local_root.join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR));

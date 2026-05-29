@@ -93,6 +93,13 @@ notify-debouncer-mini = "0.4"
 # `filetime` is the standard crate for it (works on Rust 1.70 — std::fs
 # alternatives need 1.75+).
 filetime = "0.2"
+# Content-hash compare in the mirror's initial reconciliation. We trust
+# size+mtime as a quick equality check (matching rsync's default), but
+# when sizes match and mtimes drift we hash both sides and only count
+# the files as different if the digests actually disagree. SHA-256 is
+# overkill for a "same or not?" question but it's already pulled in
+# transitively by russh/ssh-key, so making the dep explicit costs nothing.
+sha2 = "0.10"
 regex = "1.10"
 # rustls-tls so we don't drag in OpenSSL on Windows builds. multipart for blob
 # uploads; json for typed request/response bodies.
