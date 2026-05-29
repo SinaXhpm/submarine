@@ -1,9 +1,20 @@
-import { Search, Plus, Server, Globe, Folder, ChevronLeft, Trash2, Edit2, Zap } from "lucide-react";
+import { Search, Plus, Server, Globe, Folder, ChevronLeft, Trash2, Edit2, Zap, Check, X } from "lucide-react";
 import { useState } from "react";
 
-export const NodeGrid = ({ servers, folders, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, isMobile }: any) => {
+export const NodeGrid = ({ servers, folders, onOpenServer, onEditServer, onAddClick, onQuickConnect, onRemoveServer, onRemoveFolder, onRenameFolder, isMobile }: any) => {
   const [search, setSearch] = useState("");
   const [activeFolderId, setActiveFolderId] = useState<number | null>(null);
+  // Per-folder inline rename state. Only one folder can be in edit mode at
+  // a time, so a single { id, draft } slot is enough.
+  const [renaming, setRenaming] = useState<{ id: number; draft: string } | null>(null);
+  const commitRename = async () => {
+    if (!renaming || !onRenameFolder) return;
+    const next = renaming.draft.trim();
+    if (next && next !== folders?.find((f: any) => f.id === renaming.id)?.name) {
+      try { await onRenameFolder(renaming.id, next); } catch { /* parent surfaces error */ }
+    }
+    setRenaming(null);
+  };
 
   const filteredServers = servers?.filter((s: any) => 
     s.name.toLowerCase().includes(search.toLowerCase()) || 
@@ -56,24 +67,70 @@ export const NodeGrid = ({ servers, folders, onOpenServer, onEditServer, onAddCl
 
   const FolderCard = ({ f }: { f: any }) => {
     const serverCount = servers?.filter((s: any) => s.folder_id === f.id).length || 0;
+    const isRenaming = renaming?.id === f.id;
     return (
-      <div 
-        key={f.id} 
-        onClick={() => setActiveFolderId(f.id)}
+      <div
+        key={f.id}
+        onClick={() => { if (!isRenaming) setActiveFolderId(f.id); }}
         className="p-3 h-14 bg-[#1c1c21] rounded-xl border border-white/5 hover:border-primary/50 hover:bg-white/5 transition-all cursor-pointer group flex items-center justify-between shadow-inner"
       >
-        <div className="flex items-center gap-3 min-w-0">
+        <div className="flex items-center gap-3 min-w-0 flex-1">
           <Folder size={18} className="text-primary shrink-0" />
-          <h3 className="font-bold text-zinc-200 text-[13px] truncate tracking-tight">{f.name}</h3>
+          {isRenaming ? (
+            <input
+              autoFocus
+              value={renaming!.draft}
+              onChange={(e) => setRenaming({ id: f.id, draft: e.target.value })}
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") { e.preventDefault(); commitRename(); }
+                if (e.key === "Escape") { e.preventDefault(); setRenaming(null); }
+              }}
+              className="flex-1 h-7 px-2 bg-black/40 border border-primary/40 rounded text-[13px] font-bold text-white outline-none"
+            />
+          ) : (
+            <h3 className="font-bold text-zinc-200 text-[13px] truncate tracking-tight">{f.name}</h3>
+          )}
         </div>
-        <div className="flex items-center gap-2 relative">
-          <span className="text-[10px] bg-black text-zinc-500 px-1.5 py-0.5 rounded-md font-mono shrink-0 group-hover:opacity-0 transition-opacity">{serverCount}</span>
-          <button 
-            onClick={(e) => { e.stopPropagation(); if(window.confirm('Delete this folder and everything inside?')) onRemoveFolder(f.id); }}
-            className="absolute right-0 opacity-0 group-hover:opacity-100 p-1.5 text-zinc-500 hover:text-red-500 transition-all"
-          >
-            <Trash2 size={14} />
-          </button>
+        <div className="flex items-center gap-1 relative shrink-0">
+          {isRenaming ? (
+            <>
+              <button
+                onClick={(e) => { e.stopPropagation(); commitRename(); }}
+                title="Save name"
+                className="p-1.5 text-emerald-400 hover:bg-white/10 rounded"
+              >
+                <Check size={14} />
+              </button>
+              <button
+                onClick={(e) => { e.stopPropagation(); setRenaming(null); }}
+                title="Cancel"
+                className="p-1.5 text-zinc-400 hover:text-rose-400 hover:bg-white/10 rounded"
+              >
+                <X size={14} />
+              </button>
+            </>
+          ) : (
+            <>
+              <span className="text-[10px] bg-black text-zinc-500 px-1.5 py-0.5 rounded-md font-mono group-hover:opacity-0 transition-opacity">{serverCount}</span>
+              <div className="absolute right-0 flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
+                <button
+                  onClick={(e) => { e.stopPropagation(); setRenaming({ id: f.id, draft: f.name || "" }); }}
+                  title="Rename folder"
+                  className="p-1.5 text-zinc-500 hover:text-primary transition-all"
+                >
+                  <Edit2 size={14} />
+                </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); if(window.confirm('Delete this folder and everything inside?')) onRemoveFolder(f.id); }}
+                  title="Delete folder"
+                  className="p-1.5 text-zinc-500 hover:text-red-500 transition-all"
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            </>
+          )}
         </div>
       </div>
     );
@@ -97,15 +154,24 @@ export const NodeGrid = ({ servers, folders, onOpenServer, onEditServer, onAddCl
         {/* Header navigation if in folder */}
         {!isSearching && activeFolderId !== null && (
           <div className="flex items-center gap-3 mb-6">
-            <button 
+            <button
               onClick={() => setActiveFolderId(null)}
               className="w-8 h-8 bg-black rounded-xl border border-white/5 flex items-center justify-center hover:bg-white/10 hover:text-white text-zinc-500 transition-all shadow-inner"
             >
               <ChevronLeft size={16} />
             </button>
-            <h2 className="text-[15px] font-bold text-primary tracking-tight flex items-center gap-2">
+            <h2 className="text-[15px] font-bold text-primary tracking-tight flex items-center gap-2 flex-1">
               <Folder size={16} /> {currentFolder?.name}
             </h2>
+            {/* Adding a server from inside a folder pre-selects this folder
+                in the new-node panel, so the user doesn't have to repeat
+                the choice they just clicked into. */}
+            <button
+              onClick={() => onAddClick(activeFolderId)}
+              className="h-8 px-3 bg-primary/15 text-primary border border-primary/30 hover:bg-primary/25 rounded-lg flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider"
+            >
+              <Plus size={13} /> Add server
+            </button>
           </div>
         )}
 

@@ -1083,6 +1083,26 @@ async fn add_folder(state: tauri::State<'_, DbState>, name: String, parent_id: O
 }
 
 #[tauri::command]
+async fn rename_folder(state: tauri::State<'_, DbState>, id: i32, name: String) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("[VALIDATION] FOLDER_NAME_EMPTY".into());
+    }
+    let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
+    let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
+    let affected = conn.execute(
+        "UPDATE folders SET name=?1 WHERE id=?2",
+        rusqlite::params![trimmed, id],
+    ).map_err(|e| format!("[DATABASE] FOLDER_RENAME_FAILED: {}", e))?;
+    if affected == 0 {
+        return Err(format!("[DATABASE] FOLDER_RENAME_FAILED: no folder with id {}", id));
+    }
+    drop(conn_guard);
+    save_vault_internal(&state)?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn delete_folder(state: tauri::State<'_, DbState>, id: i32) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
     let conn = conn_guard.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
@@ -3382,7 +3402,7 @@ fn main() {
             cloud::cloud_sync_overview, cloud::cloud_sync_all,
             add_server, edit_server, delete_server, get_servers, get_ssh_keys, 
             get_credentials, generate_ssh_key,
-            add_folder, delete_folder, get_folders,
+            add_folder, rename_folder, delete_folder, get_folders,
             add_command, edit_command, delete_command, get_commands,
             add_note, edit_note, delete_note, get_notes,
             add_credential, edit_credential, delete_credential,

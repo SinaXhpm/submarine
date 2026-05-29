@@ -38,6 +38,10 @@ app-icon-circular.png
 # Discarded alternative logos / experiments. Kept locally but not shipped.
 app-icon2.png
 app-icon3.png
+# Scratch directory for logo iterations / source artwork. Whatever lands as
+# the final `app-icon.png` is the canonical source; everything else stays
+# on the dev machine.
+logos/
 # Old CSS snapshot kept while migrating xterm styling — superseded by
 # the current src/index.css. Not part of the build.
 original_index.css

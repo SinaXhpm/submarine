@@ -209,6 +209,17 @@ function DesktopApp() {
     } catch (e) { addLog(`DELETE_EXCEPTION: ${e}`, "error"); }
   };
 
+  const renameFolder = async (id: number, name: string) => {
+    try {
+      await invoke("rename_folder", { id, name });
+      await refreshFolders();
+      addLog(`Folder renamed to "${name}".`, "info");
+    } catch (e) {
+      addLog(`RENAME_EXCEPTION: ${e}`, "error");
+      throw e; // bubble up so NodeGrid can keep the input open if the user wants to retry
+    }
+  };
+
   // ProfileSelectPage handles the entire profile pick + password + create
   // flow on a single screen. By the time it fires `onUnlocked`, the
   // backend has both selected the profile AND decrypted the DB — we just
@@ -413,10 +424,21 @@ function DesktopApp() {
                 folders={folders}
                 onOpenServer={openServer}
                 onEditServer={handleEditNode}
-                onAddClick={() => { setNewNode(defaultNode); setIsPanelOpen(true); }}
+                onAddClick={(folderId?: number | null) => {
+                  // When invoked from inside a folder header, seed the new
+                  // node's folderId so the user doesn't have to re-pick the
+                  // folder they just clicked into. Bare invocation (from the
+                  // root grid's "Add server" card) stays at the empty default.
+                  setNewNode({
+                    ...defaultNode,
+                    folderId: folderId != null ? String(folderId) : "",
+                  });
+                  setIsPanelOpen(true);
+                }}
                 onQuickConnect={() => setIsQuickConnectOpen(true)}
                 onRemoveServer={removeServer}
                 onRemoveFolder={removeFolder}
+                onRenameFolder={renameFolder}
                 isMobile={isMobile}
               />
             )}

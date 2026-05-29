@@ -174,11 +174,11 @@ jobs:
         run: |
           APP_DIR="src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos"
           cd "$APP_DIR"
-          # The .app folder is named after productName ("submarine").
+          # The .app folder is named after productName ("Submarine").
           # Wrap it in a versioned zip for the release asset name.
           ARCH="${{ matrix.os_name }}"
           ZIP_NAME="Submarine-${{ github.ref_name }}-${ARCH}.app.zip"
-          ditto -c -k --sequesterRsrc --keepParent "submarine.app" "$ZIP_NAME"
+          ditto -c -k --sequesterRsrc --keepParent "Submarine.app" "$ZIP_NAME"
           echo "MAC_ZIP=$APP_DIR/$ZIP_NAME" >> $GITHUB_ENV
 
       # Collect every artifact this job produced into one folder for upload.

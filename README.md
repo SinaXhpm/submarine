@@ -13,18 +13,19 @@
 
 ## What it is
 
-Submarine is a fast, local-first SSH/SFTP client with optional end-to-end encrypted cloud sync of your saved hosts. Built with Rust (Tauri 2) and React — small binary, native feel, no Electron.
+Submarine is a fast, local-first SSH/SFTP client with optional end-to-end encrypted profile sync across your machines. Built with Rust (Tauri 2) and React — small binary, native feel, no Electron.
 
 ## Features
 
 - **SSH terminal** — tabbed sessions, full xterm.js, ANSI 256 + truecolour, mouse support
 - **SFTP browser** — drag-and-drop uploads, in-place rename, chmod/chown, dual-pane workspace
-- **Port forwarding** — local (`-L`), remote (`-R`), and dynamic SOCKS (`-D`) tunnels with status tracking
+- **Port forwarding** — local (`-L`), remote (`-R`), and dynamic SOCKS/HTTP (`-D`) tunnels — SOCKS4/4a, SOCKS5/5h, HTTP CONNECT, plain HTTP proxy
 - **Resource monitor** — live CPU / RAM / disk / network sparklines per host
-- **Quick commands** — per-host snippets you can fire into any open shell
+- **Quick commands + notes** — per-profile editable snippets, surfaced inside any open session via the in-pane Library
 - **Saved profiles** — passwords and private keys stored in a local AES-256-GCM vault
-- **Cloud sync (optional)** — encrypted blob sync across machines; server never sees your data
+- **End-to-end encrypted sync** — your profiles roam across machines; we only host the opaque ciphertext, never the keys
 - **Broad SSH compatibility** — Ed25519, ECDSA P-256, RSA (SHA-2/SHA-1) host keys + matching client keys; legacy KEX (DH-G14/G1) and MAC (HMAC-SHA1) for older servers
+- **Autostart** — flag any server and it opens + connects automatically when the app launches
 - **TOFU host keys** — first-use prompt with fingerprint, pinned thereafter
 - **Quick connect** — one-off connections without saving
 
@@ -32,7 +33,7 @@ Submarine is a fast, local-first SSH/SFTP client with optional end-to-end encryp
 
 - Master password derives a vault key via **Argon2id** (m=64MiB, t=3, p=4)
 - Profiles vault is **AES-256-GCM**, compressed with zstd before encryption
-- Cloud blobs are **encrypted client-side** — the API only sees opaque ciphertext
+- Sync blobs are encrypted **client-side end-to-end** — we only host the ciphertext; the master key never leaves your device, so we cannot read your data even if we wanted to
 - Master key is held in `zeroize`'d memory and wiped on lock
 - Strict CSP, minimal Tauri capability ACL, no shell/fs plugins exposed
 - Host keys pinned per-host with a per-connection nonce binding to prevent prompt-races
@@ -45,10 +46,9 @@ Grab a binary from the [latest release](https://github.com/sinaxhpm/submarine/re
 |---|---|
 | Windows | `Submarine_x.y.z_x64-setup.exe` or `.msi` |
 | macOS (Apple Silicon) | `Submarine-vx.y.z-macos-arm64.app.zip` or `.dmg` |
-| macOS (Intel) | `Submarine-vx.y.z-macos-x64.app.zip` or `.dmg` |
 | Linux | `submarine_x.y.z_amd64.AppImage` |
 
-> Builds are currently **unsigned**. Windows SmartScreen will prompt — click "More info → Run anyway". macOS users may need `xattr -d com.apple.quarantine /Applications/submarine.app`.
+> Builds are currently **unsigned**. Windows SmartScreen will prompt — click "More info → Run anyway". macOS users may need `xattr -d com.apple.quarantine /Applications/Submarine.app`.
 
 ## Build from source
 
@@ -75,7 +75,6 @@ git push origin v0.1.0
 
 **Frontend** — React 18, TypeScript, Tailwind, xterm.js
 **Backend** — Rust, Tauri 2, russh, rusqlite, aes-gcm, argon2, zstd
-**Cloud (optional)** — PHP/MySQL on shared hosting; sources live in a separate, private repo
 
 ## Credits
 

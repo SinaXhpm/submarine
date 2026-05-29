@@ -248,7 +248,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
                 ? "Let's set up your first profile."
                 : creating
                   ? "Create a new profile."
-                  : "Welcome back."}
+                  : null}
           </p>
         </div>
 
