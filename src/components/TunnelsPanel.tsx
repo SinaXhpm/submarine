@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Plus, X, Activity, AlertTriangle, Globe, ArrowRight, ArrowDownLeft, Square } from "lucide-react";
+import { Plus, X, Activity, AlertTriangle, Globe, ArrowRight, ArrowDownLeft, Square, FileText, Trash2 } from "lucide-react";
 
 // Tunnels panel — lists active SSH port-forwards for a session and lets the
 // user start / stop them on the fly. The full set is also auto-started from
@@ -16,9 +16,26 @@ interface TunnelStatus {
   state: string;       // "starting" | "listening" | "error" | "closed"
   error?: string;
   conns_total: number;
+  conns_active: number;
   bytes_in: number;
   bytes_out: number;
 }
+
+interface TunnelLogEntry {
+  tunnel_id: string;
+  ts_ms: number;
+  level: "info" | "warn" | "error";
+  event: string;        // "listen" | "connect" | "close" | "fail" | "stop" | "shutdown"
+  target?: string;
+  peer?: string;
+  message?: string;
+}
+
+// Cap the rolling log buffer so a chatty SOCKS proxy doesn't grow the array
+// unbounded across a long session. 200 is enough to scroll back through the
+// last few minutes of activity on a busy tunnel without burning React render
+// time on a 10k-entry list.
+const LOG_CAP = 200;
 
 interface TunnelsPanelProps {
   sessionId: string;
@@ -37,6 +54,11 @@ const TunnelsPanel = ({ sessionId, disabled = false }: TunnelsPanelProps) => {
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [logs, setLogs] = useState<TunnelLogEntry[]>([]);
+  const [logsOpen, setLogsOpen] = useState(true);
+  const [logFilter, setLogFilter] = useState<string | null>(null); // tunnel id, null = all
+  const logScrollRef = useRef<HTMLDivElement>(null);
+  const autoScrollRef = useRef(true);
 
   // Initial snapshot
   const reload = async () => {
@@ -72,6 +94,40 @@ const TunnelsPanel = ({ sessionId, disabled = false }: TunnelsPanelProps) => {
     }).then((fn) => { unlisten = fn; });
     return () => { if (unlisten) unlisten(); };
   }, [sessionId]);
+
+  // Connection log: per-session stream of accepted / refused / closed
+  // connections. Kept in a rolling buffer so the panel scrolls back through
+  // recent activity without unbounded memory growth.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    listen<TunnelLogEntry>(`tunnel-log-${sessionId}`, (event) => {
+      const entry = event.payload;
+      if (!entry || !entry.tunnel_id) return;
+      setLogs((prev) => {
+        const next = prev.length >= LOG_CAP ? prev.slice(prev.length - LOG_CAP + 1) : prev.slice();
+        next.push(entry);
+        return next;
+      });
+    }).then((fn) => { unlisten = fn; });
+    return () => { if (unlisten) unlisten(); };
+  }, [sessionId]);
+
+  // Auto-scroll to bottom when new logs come in — but only if the user
+  // hasn't scrolled up to read older entries. Detect "user at bottom" by
+  // checking the scroll position against the scroll height before pushing
+  // the autoscroll.
+  useEffect(() => {
+    const el = logScrollRef.current;
+    if (!el || !autoScrollRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [logs]);
+
+  const onLogScroll = () => {
+    const el = logScrollRef.current;
+    if (!el) return;
+    const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
+    autoScrollRef.current = dist < 32;
+  };
 
   const addTunnel = async () => {
     if (busy) return;
@@ -232,9 +288,20 @@ const TunnelsPanel = ({ sessionId, disabled = false }: TunnelsPanelProps) => {
                     </>
                   )}
                   <button
+                    onClick={() => setLogFilter(logFilter === t.id ? null : t.id)}
+                    title={logFilter === t.id ? "Show all tunnels in log" : "Filter log to this tunnel"}
+                    className={`ml-1 p-0.5 rounded shrink-0 ${
+                      logFilter === t.id
+                        ? "bg-primary/20 text-primary"
+                        : "text-zinc-400 hover:text-primary hover:bg-white/10"
+                    }`}
+                  >
+                    <FileText size={11} />
+                  </button>
+                  <button
                     onClick={() => stopOne(t.id)}
                     title="Stop"
-                    className="ml-1 p-0.5 rounded hover:bg-white/10 text-zinc-400 hover:text-rose-400 shrink-0"
+                    className="p-0.5 rounded hover:bg-white/10 text-zinc-400 hover:text-rose-400 shrink-0"
                   >
                     <Square size={11} />
                   </button>
@@ -248,8 +315,13 @@ const TunnelsPanel = ({ sessionId, disabled = false }: TunnelsPanelProps) => {
                   }`}>
                     {t.state}
                   </span>
-                  <span title="connections accepted since this tunnel started">
-                    {t.conns_total} {t.conns_total === 1 ? "conn" : "conns"}
+                  <span title="connections currently bridged / total accepted since start">
+                    <span className={t.conns_active > 0 ? "text-emerald-300" : "text-zinc-500"}>
+                      {t.conns_active}
+                    </span>
+                    <span className="opacity-50"> active</span>
+                    <span className="opacity-30"> · </span>
+                    <span>{t.conns_total} total</span>
                   </span>
                   {t.error && (
                     <span className="text-rose-400 truncate" title={t.error}>· {t.error}</span>
@@ -258,6 +330,106 @@ const TunnelsPanel = ({ sessionId, disabled = false }: TunnelsPanelProps) => {
               </div>
             );
           })
+        )}
+      </div>
+
+      {/* Activity log — rolling feed of connect / close / fail events across
+          all tunnels in this session, or filtered to one via the row icon.
+          Auto-scrolls to bottom unless the user has scrolled up to read
+          older entries. */}
+      <div className="shrink-0 border-t border-white/5 bg-[#0c0c0e]">
+        <div className="px-3 py-1.5 flex items-center justify-between border-b border-white/5">
+          <button
+            onClick={() => setLogsOpen((o) => !o)}
+            className="text-[10px] font-bold uppercase tracking-widest text-zinc-400 hover:text-zinc-200 flex items-center gap-1.5"
+          >
+            <FileText size={11} />
+            <span>Log</span>
+            <span className="text-zinc-600 font-normal">
+              ({logFilter ? logs.filter((l) => l.tunnel_id === logFilter).length : logs.length})
+            </span>
+            {logFilter && (
+              <span className="ml-1 px-1.5 rounded bg-primary/15 text-primary text-[9px]">filtered</span>
+            )}
+          </button>
+          <div className="flex items-center gap-1">
+            {logFilter && (
+              <button
+                onClick={() => setLogFilter(null)}
+                title="Show all tunnels"
+                className="px-1.5 text-[9px] uppercase tracking-wider text-zinc-500 hover:text-zinc-200"
+              >
+                Clear filter
+              </button>
+            )}
+            <button
+              onClick={() => setLogs([])}
+              title="Clear log"
+              className="p-1 text-zinc-500 hover:text-rose-400 rounded hover:bg-white/5"
+            >
+              <Trash2 size={11} />
+            </button>
+            <button
+              onClick={() => setLogsOpen((o) => !o)}
+              title={logsOpen ? "Collapse" : "Expand"}
+              className="p-1 text-zinc-500 hover:text-zinc-200 rounded hover:bg-white/5"
+            >
+              {logsOpen ? <ArrowDownLeft size={11} className="rotate-90" /> : <ArrowDownLeft size={11} className="-rotate-90" />}
+            </button>
+          </div>
+        </div>
+        {logsOpen && (
+          <div
+            ref={logScrollRef}
+            onScroll={onLogScroll}
+            className="h-40 overflow-auto px-2 py-1 font-mono text-[10.5px] leading-relaxed space-y-0.5"
+          >
+            {(() => {
+              const visible = logFilter ? logs.filter((l) => l.tunnel_id === logFilter) : logs;
+              if (visible.length === 0) {
+                return (
+                  <div className="text-zinc-600 text-center py-4">
+                    No log entries {logFilter ? "for this tunnel" : "yet"}.
+                  </div>
+                );
+              }
+              return visible.map((l, i) => {
+                const ts = new Date(l.ts_ms);
+                const hh = String(ts.getHours()).padStart(2, "0");
+                const mm = String(ts.getMinutes()).padStart(2, "0");
+                const ss = String(ts.getSeconds()).padStart(2, "0");
+                const tone =
+                  l.level === "error" ? "text-rose-300" :
+                  l.level === "warn"  ? "text-amber-300" :
+                                        "text-zinc-400";
+                const eventTone =
+                  l.event === "fail"    ? "bg-rose-500/15 text-rose-300" :
+                  l.event === "connect" ? "bg-emerald-500/15 text-emerald-300" :
+                  l.event === "close"   ? "bg-white/5 text-zinc-500" :
+                  l.event === "listen"  ? "bg-indigo-500/15 text-indigo-300" :
+                  l.event === "stop" || l.event === "shutdown"
+                                        ? "bg-amber-500/15 text-amber-300" :
+                                          "bg-white/5 text-zinc-500";
+                return (
+                  <div key={i} className="flex items-start gap-1.5">
+                    <span className="text-zinc-600 shrink-0">{hh}:{mm}:{ss}</span>
+                    <span className={`px-1 rounded text-[9px] uppercase font-bold shrink-0 ${eventTone}`}>
+                      {l.event}
+                    </span>
+                    <span className={`flex-1 break-all ${tone}`}>
+                      {l.target && <span className="text-zinc-200">{l.target}</span>}
+                      {l.peer && <span className="text-zinc-600"> ← {l.peer}</span>}
+                      {l.message && (
+                        <span className={l.target || l.peer ? "text-zinc-500 ml-1" : ""}>
+                          {l.target || l.peer ? "· " : ""}{l.message}
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                );
+              });
+            })()}
+          </div>
         )}
       </div>
     </div>

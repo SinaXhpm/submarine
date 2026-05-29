@@ -54,11 +54,13 @@ pub struct TunnelStatus {
     pub state: String, // "starting", "listening", "error", "closed"
     pub error: Option<String>,
     /// Total accepted connections since this tunnel started (monotonic).
-    /// We deliberately do NOT track "currently active" connections: with
-    /// russh channels + tokio::io::copy_bidirectional we can't reliably
-    /// detect half-closed / keep-alive sockets, so any "active" count
-    /// would drift upwards and mislead the user.
     pub conns_total: u32,
+    /// Number of connections currently bridged through this tunnel. Backed
+    /// by an RAII guard on each spawned bridge task: the count increments
+    /// when the task starts and decrements when the task's future ends,
+    /// regardless of whether it ended cleanly, with an error, or via the
+    /// stop-signal shutdown path.
+    pub conns_active: u32,
     pub bytes_in: u64,
     pub bytes_out: u64,
 }
@@ -150,6 +152,104 @@ async fn emit_update(app: &AppHandle, status: &TunnelStatus) {
     );
 }
 
+/// Per-event log entry pushed to `tunnel-log-{session_id}`. The UI keeps a
+/// short rolling buffer per tunnel so the user can see what addresses traffic
+/// is going to and which connections are failing without having to dig
+/// through stderr or a debug log file.
+#[derive(Debug, Clone, Serialize)]
+struct TunnelLogEntry<'a> {
+    tunnel_id: &'a str,
+    /// Wall-clock millis since UNIX epoch. UI formats this on render so we
+    /// don't pay a String-allocation cost on the hot bridge path.
+    ts_ms: u128,
+    /// "info" | "warn" | "error". Drives the UI colour.
+    level: &'a str,
+    /// Short human-readable event ("connect", "fail", "close", ...).
+    event: &'a str,
+    /// Destination the connection targeted, when known.
+    target: Option<String>,
+    /// Source peer (the client that connected to our local listener).
+    peer: Option<String>,
+    /// Free-form detail — typically the error string on failures.
+    message: Option<String>,
+}
+
+fn now_ms() -> u128 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn emit_log(
+    app: &AppHandle,
+    session_id: &str,
+    tunnel_id: &str,
+    level: &str,
+    event: &str,
+    target: Option<String>,
+    peer: Option<String>,
+    message: Option<String>,
+) {
+    let entry = TunnelLogEntry {
+        tunnel_id,
+        ts_ms: now_ms(),
+        level,
+        event,
+        target,
+        peer,
+        message,
+    };
+    let _ = app.emit(&format!("tunnel-log-{}", session_id), entry);
+}
+
+/// RAII counter for in-flight bridged connections. Increments
+/// `status.conns_active` on construction and decrements it on drop,
+/// emitting an update either side so the UI tracks the change in real
+/// time. Drop is sync, so the decrement-and-emit step is offloaded to a
+/// short-lived spawned task — the count itself is held in an AtomicU32
+/// shared across the listener so the actual increment/decrement is
+/// instant and lock-free; the mutex'd `TunnelStatus` is only touched
+/// for the UI emit.
+struct ActiveGuard {
+    counter: Arc<AtomicU32>,
+    status: Arc<Mutex<TunnelStatus>>,
+    app: AppHandle,
+}
+
+impl ActiveGuard {
+    async fn enter(
+        counter: Arc<AtomicU32>,
+        status: Arc<Mutex<TunnelStatus>>,
+        app: AppHandle,
+    ) -> Self {
+        let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        {
+            let mut s = status.lock().await;
+            s.conns_active = n;
+            s.conns_total = s.conns_total.saturating_add(1);
+        }
+        emit_update(&app, &status.lock().await.clone()).await;
+        Self { counter, status, app }
+    }
+}
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        let n = self.counter.fetch_sub(1, Ordering::Relaxed).saturating_sub(1);
+        let status = Arc::clone(&self.status);
+        let app = self.app.clone();
+        tauri::async_runtime::spawn(async move {
+            {
+                let mut s = status.lock().await;
+                s.conns_active = n;
+            }
+            emit_update(&app, &status.lock().await.clone()).await;
+        });
+    }
+}
+
 async fn set_state(
     app: &AppHandle,
     status_arc: &Arc<Mutex<TunnelStatus>>,
@@ -225,6 +325,7 @@ pub async fn start_tunnel(
         state: "starting".into(),
         error: None,
         conns_total: 0,
+        conns_active: 0,
         bytes_in: 0,
         bytes_out: 0,
     };
@@ -405,13 +506,14 @@ async fn run_local_forward(
     status: Arc<Mutex<TunnelStatus>>,
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<(), String> {
+    let tunnel_id = status.lock().await.id.clone();
     set_state(&app, &status, "listening", None).await;
+    emit_log(&app, &session_id, &tunnel_id, "info", "listen",
+             Some(target.clone()), None,
+             Some(format!("Local forward up; forwarding to {}", target)));
 
     let (target_host, target_port) = parse_target(&target)?;
-    let conns_total = Arc::new(AtomicU32::new(0));
-    // Broadcast lets us wake every in-flight bridge when the user stops the
-    // tunnel — otherwise copy_bidirectional would keep the local socket and
-    // the SSH channel alive until one side closes naturally (could be hours).
+    let active = Arc::new(AtomicU32::new(0));
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     loop {
@@ -422,34 +524,34 @@ async fn run_local_forward(
             }
             accepted = listener.accept() => {
                 let (sock, peer) = accepted.map_err(|e| format!("accept: {}", e))?;
-                // Latency over a forwarded TCP stream is dominated by Nagle if
-                // the client makes lots of small writes — disable here to keep
-                // the tunnel behavior comparable to a direct local connection.
                 let _ = sock.set_nodelay(true);
                 let handle = Arc::clone(&handle);
                 let status = Arc::clone(&status);
                 let app = app.clone();
                 let session_id = session_id.clone();
                 let target_host = target_host.clone();
-                let conns_total = Arc::clone(&conns_total);
+                let target_full = format!("{}:{}", target_host, target_port);
+                let active = Arc::clone(&active);
+                let tunnel_id = tunnel_id.clone();
                 let mut shutdown_rx = shutdown_tx.subscribe();
-                let _ = session_id; // silence unused if logging disabled
 
                 tauri::async_runtime::spawn(async move {
-                    let n = conns_total.fetch_add(1, Ordering::Relaxed) + 1;
-                    {
-                        let mut s = status.lock().await;
-                        s.conns_total = n;
-                    }
-                    emit_update(&app, &status.lock().await.clone()).await;
+                    let _guard = ActiveGuard::enter(active, Arc::clone(&status), app.clone()).await;
+                    emit_log(&app, &session_id, &tunnel_id, "info", "connect",
+                             Some(target_full.clone()), Some(peer.to_string()), None);
 
                     tokio::select! {
-                        _ = shutdown_rx.recv() => {}
+                        _ = shutdown_rx.recv() => {
+                            emit_log(&app, &session_id, &tunnel_id, "info", "stop",
+                                     Some(target_full), Some(peer.to_string()),
+                                     Some("Tunnel stopped".into()));
+                        }
                         res = bridge_local_to_channel(handle, sock, peer, target_host, target_port) => {
-                            if let Err(e) = res {
-                                // Don't bubble up — one failed connection shouldn't tear
-                                // down the listener. Just log via stderr.
-                                eprintln!("[tunnel] local-forward bridge error: {}", e);
+                            match res {
+                                Ok(()) => emit_log(&app, &session_id, &tunnel_id, "info", "close",
+                                                  Some(target_full), Some(peer.to_string()), None),
+                                Err(e) => emit_log(&app, &session_id, &tunnel_id, "error", "fail",
+                                                  Some(target_full), Some(peer.to_string()), Some(e)),
                             }
                         }
                     }
@@ -457,6 +559,7 @@ async fn run_local_forward(
             }
         }
     }
+    emit_log(&app, &session_id, &tunnel_id, "info", "shutdown", None, None, None);
     Ok(())
 }
 
@@ -490,10 +593,13 @@ async fn run_dynamic_forward(
     status: Arc<Mutex<TunnelStatus>>,
     mut stop_rx: oneshot::Receiver<()>,
 ) -> Result<(), String> {
+    let tunnel_id = status.lock().await.id.clone();
     set_state(&app, &status, "listening", None).await;
+    emit_log(&app, &session_id, &tunnel_id, "info", "listen",
+             Some("SOCKS4 / SOCKS5".into()), None,
+             Some("Dynamic forward up; accepting SOCKS4 + SOCKS5 (CONNECT)".into()));
 
-    let conns_total = Arc::new(AtomicU32::new(0));
-    // See run_local_forward — broadcast wakes in-flight SOCKS bridges on stop.
+    let active = Arc::new(AtomicU32::new(0));
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     loop {
@@ -504,29 +610,27 @@ async fn run_dynamic_forward(
             }
             accepted = listener.accept() => {
                 let (sock, peer) = accepted.map_err(|e| format!("accept: {}", e))?;
-                // See run_local_forward — Nagle hurts interactive workloads.
                 let _ = sock.set_nodelay(true);
                 let handle = Arc::clone(&handle);
                 let status = Arc::clone(&status);
                 let app = app.clone();
                 let session_id = session_id.clone();
-                let conns_total = Arc::clone(&conns_total);
+                let active = Arc::clone(&active);
+                let tunnel_id = tunnel_id.clone();
                 let mut shutdown_rx = shutdown_tx.subscribe();
-                let _ = session_id;
 
                 tauri::async_runtime::spawn(async move {
-                    let n = conns_total.fetch_add(1, Ordering::Relaxed) + 1;
-                    {
-                        let mut s = status.lock().await;
-                        s.conns_total = n;
-                    }
-                    emit_update(&app, &status.lock().await.clone()).await;
+                    let _guard = ActiveGuard::enter(active, Arc::clone(&status), app.clone()).await;
 
                     tokio::select! {
-                        _ = shutdown_rx.recv() => {}
-                        res = handle_socks5(handle, sock, peer) => {
+                        _ = shutdown_rx.recv() => {
+                            emit_log(&app, &session_id, &tunnel_id, "info", "stop",
+                                     None, Some(peer.to_string()), Some("Tunnel stopped".into()));
+                        }
+                        res = handle_socks(handle, sock, peer, app.clone(), session_id.clone(), tunnel_id.clone()) => {
                             if let Err(e) = res {
-                                eprintln!("[tunnel] socks5 error: {}", e);
+                                emit_log(&app, &session_id, &tunnel_id, "error", "fail",
+                                         None, Some(peer.to_string()), Some(e));
                             }
                         }
                     }
@@ -534,6 +638,7 @@ async fn run_dynamic_forward(
             }
         }
     }
+    emit_log(&app, &session_id, &tunnel_id, "info", "shutdown", None, None, None);
     Ok(())
 }
 
@@ -631,21 +736,135 @@ pub async fn bridge_forwarded_channel(
     }
 }
 
-/// Minimal SOCKS5 server: NO-AUTH greeting, CONNECT (cmd 0x01) only,
-/// IPv4 / IPv6 / domain address types. Anything else gets a clean error reply
-/// and the connection closes.
+/// Sniff the first byte of the client greeting to figure out which SOCKS
+/// version the client speaks, then hand off to the version-specific handler.
+/// Supports SOCKS4 + SOCKS4a + SOCKS5 (which inherently covers SOCKS5h since
+/// the protocol field already carries hostnames). Anything else gets a clean
+/// rejection and a log line.
+async fn handle_socks(
+    handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
+    mut sock: tokio::net::TcpStream,
+    peer: SocketAddr,
+    app: AppHandle,
+    session_id: String,
+    tunnel_id: String,
+) -> Result<(), String> {
+    let mut ver = [0u8; 1];
+    sock.read_exact(&mut ver).await.map_err(|e| format!("read version: {}", e))?;
+    match ver[0] {
+        0x05 => handle_socks5(handle, sock, peer, app, session_id, tunnel_id).await,
+        0x04 => handle_socks4(handle, sock, peer, app, session_id, tunnel_id).await,
+        v => Err(format!("Unknown SOCKS version 0x{:02x}", v)),
+    }
+}
+
+/// SOCKS4 / SOCKS4a — CONNECT (cmd 0x01) only. The version byte has already
+/// been consumed by handle_socks. Format: VN(consumed) CD(1) DSTPORT(2)
+/// DSTIP(4) USERID(null-terminated). If DSTIP is 0.0.0.X (SOCKS4a marker),
+/// the hostname follows USERID, also null-terminated.
+async fn handle_socks4(
+    handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
+    mut sock: tokio::net::TcpStream,
+    peer: SocketAddr,
+    app: AppHandle,
+    session_id: String,
+    tunnel_id: String,
+) -> Result<(), String> {
+    let mut hdr = [0u8; 7]; // CD + DSTPORT(2) + DSTIP(4)
+    sock.read_exact(&mut hdr).await.map_err(|e| format!("socks4 read req: {}", e))?;
+    let cmd = hdr[0];
+    let port = u16::from_be_bytes([hdr[1], hdr[2]]);
+    let ip = [hdr[3], hdr[4], hdr[5], hdr[6]];
+
+    // Read userid (ignored — we don't authenticate) until NUL.
+    let userid = read_until_nul(&mut sock, 256).await
+        .map_err(|e| format!("socks4 read userid: {}", e))?;
+    let _ = userid;
+
+    if cmd != 0x01 {
+        // 0x5B = request rejected. SOCKS4 reply: VN(0) + CD(1) + ignored(6).
+        let _ = sock.write_all(&[0x00, 0x5B, 0, 0, 0, 0, 0, 0]).await;
+        return Err(format!("SOCKS4 command 0x{:02x} not supported (only CONNECT)", cmd));
+    }
+
+    // SOCKS4a hostname extension: DSTIP = 0.0.0.X with X != 0 → hostname
+    // follows the userid, also NUL-terminated.
+    let target_host = if ip[0] == 0 && ip[1] == 0 && ip[2] == 0 && ip[3] != 0 {
+        let host_bytes = read_until_nul(&mut sock, 256).await
+            .map_err(|e| format!("socks4a read host: {}", e))?;
+        String::from_utf8(host_bytes).map_err(|e| format!("socks4a host non-utf8: {}", e))?
+    } else {
+        format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+    };
+
+    let target_full = format!("{}:{}", target_host, port);
+    emit_log(&app, &session_id, &tunnel_id, "info", "connect",
+             Some(target_full.clone()), Some(peer.to_string()), Some("via SOCKS4".into()));
+
+    let channel = {
+        let h = handle.lock().await;
+        h.channel_open_direct_tcpip(target_host.clone(), port as u32,
+                                     peer.ip().to_string(), peer.port() as u32).await
+    };
+
+    let channel = match channel {
+        Ok(c) => {
+            // 0x5A = request granted.
+            sock.write_all(&[0x00, 0x5A, hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6]])
+                .await
+                .map_err(|e| format!("socks4 reply: {}", e))?;
+            c
+        }
+        Err(e) => {
+            let _ = sock.write_all(&[0x00, 0x5B, hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6]]).await;
+            emit_log(&app, &session_id, &tunnel_id, "error", "fail",
+                     Some(target_full), Some(peer.to_string()), Some(e.to_string()));
+            return Err(format!("direct-tcpip {}:{} failed: {}", target_host, port, e));
+        }
+    };
+
+    let mut stream = channel.into_stream();
+    let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+    emit_log(&app, &session_id, &tunnel_id, "info", "close",
+             Some(target_full), Some(peer.to_string()), None);
+    Ok(())
+}
+
+/// Read bytes from `sock` until either NUL or the cap is reached. Returns
+/// everything BEFORE the NUL. Used to consume SOCKS4 USERID + the SOCKS4a
+/// hostname extension, both of which are NUL-terminated and unbounded by
+/// the spec — we cap at 256 bytes to refuse malicious clients trying to
+/// stream forever.
+async fn read_until_nul(sock: &mut tokio::net::TcpStream, max: usize) -> std::io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(32);
+    let mut b = [0u8; 1];
+    loop {
+        sock.read_exact(&mut b).await?;
+        if b[0] == 0 || out.len() >= max {
+            break;
+        }
+        out.push(b[0]);
+    }
+    Ok(out)
+}
+
+/// SOCKS5 server: NO-AUTH greeting, CONNECT (cmd 0x01) only, IPv4 / IPv6 /
+/// domain address types (domain mode is what SOCKS5h clients send — the
+/// protocol doesn't have a separate version). Anything else gets a clean
+/// error reply and the connection closes. The leading version byte was
+/// already consumed by `handle_socks`.
 async fn handle_socks5(
     handle: Arc<Mutex<russh::client::Handle<ClientHandler>>>,
     mut sock: tokio::net::TcpStream,
     peer: SocketAddr,
+    app: AppHandle,
+    session_id: String,
+    tunnel_id: String,
 ) -> Result<(), String> {
-    // --- Greeting ---
-    let mut hdr = [0u8; 2];
-    sock.read_exact(&mut hdr).await.map_err(|e| format!("read greeting: {}", e))?;
-    if hdr[0] != 0x05 {
-        return Err(format!("unsupported SOCKS version {:#x}", hdr[0]));
-    }
-    let n_methods = hdr[1] as usize;
+    // --- Greeting (version already consumed by handle_socks) ---
+    let mut nm = [0u8; 1];
+    sock.read_exact(&mut nm).await.map_err(|e| format!("read methods cnt: {}", e))?;
+    let n_methods = nm[0] as usize;
     let mut methods = vec![0u8; n_methods];
     sock.read_exact(&mut methods).await.map_err(|e| format!("read methods: {}", e))?;
     // Always reply NO-AUTH (0x00). If the client didn't offer it, send
@@ -703,6 +922,16 @@ async fn handle_socks5(
     sock.read_exact(&mut port_buf).await.map_err(|e| format!("read port: {}", e))?;
     let target_port = u16::from_be_bytes(port_buf);
 
+    let target_full = format!("{}:{}", target_host, target_port);
+    let via = match atyp {
+        0x01 => "via SOCKS5 (IPv4)",
+        0x03 => "via SOCKS5h (hostname)",
+        0x04 => "via SOCKS5 (IPv6)",
+        _ => "via SOCKS5",
+    };
+    emit_log(&app, &session_id, &tunnel_id, "info", "connect",
+             Some(target_full.clone()), Some(peer.to_string()), Some(via.into()));
+
     // --- Open the SSH direct-tcpip channel ---
     let channel = {
         let h = handle.lock().await;
@@ -727,11 +956,15 @@ async fn handle_socks5(
         Err(e) => {
             // 0x05 = connection refused (best general-purpose code)
             let _ = sock.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+            emit_log(&app, &session_id, &tunnel_id, "error", "fail",
+                     Some(target_full), Some(peer.to_string()), Some(e.to_string()));
             return Err(format!("direct-tcpip {}:{} failed: {}", target_host, target_port, e));
         }
     };
 
     let mut stream = channel.into_stream();
     let _ = tokio::io::copy_bidirectional(&mut sock, &mut stream).await;
+    emit_log(&app, &session_id, &tunnel_id, "info", "close",
+             Some(target_full), Some(peer.to_string()), None);
     Ok(())
 }
